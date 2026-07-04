@@ -3,11 +3,25 @@
 // LoRa gateway (which runs on the Arduino loop, core 1).
 #include "gateway_web.h"
 #include "reader.h"
+#include "flash_dbg.h"
 #include <WiFi.h>
 #include <WiFiManager.h>          // tzapu/WiFiManager
 #include <WebServer.h>
+#include <Update.h>               // ESP32 self-OTA (reflash our own app into the other OTA slot)
+#include <esp_partition.h>        // partition list for the /debug hex editor
+#include <esp_mac.h>              // base MAC for the per-device setup-AP name
 #include <PubSubClient.h>         // knolleary/PubSubClient
 #include <Preferences.h>
+#include "board_config.h"         // OBI_HAS_EPD + e-paper pins (Heltec Vision Master E290)
+
+#ifdef OBI_HAS_EPD
+#include <GxEPD2_BW.h>            // zinggjm/GxEPD2 (DEPG0290BNS800 / SSD1680, 296x128)
+#include <SPI.h>
+static SPIClass epdSPI(HSPI);     // dedicated bus — LoRa keeps the default SPI to itself
+static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT>
+        epd(GxEPD2_290_BS(PIN_EINK_CS, PIN_EINK_DC, PIN_EINK_RST, PIN_EINK_BUSY));
+static bool g_epdOk = false;
+#endif
 
 static WebServer    server(80);
 static WiFiClient    net;
@@ -17,6 +31,19 @@ static WiFiManager   wm;
 static WiFiManagerParameter *pHost, *pPort, *pUser, *pPass, *pTopic;
 static bool     g_serverUp = false;
 static bool     g_wifiOk   = false;
+static volatile bool g_portalReq = false;   // set by the /api/wifi button -> webTask opens the WM portal
+static bool          g_apActive  = false;   // our own setup AP is up (unconfigured / WiFi lost)
+static volatile bool g_mqttUp    = false;   // cached mqtt.connected() — read by the e-paper task (no cross-task PubSubClient)
+
+// Per-device setup-AP name: "OpenOBI-XXXXXX" (last 3 MAC bytes) so two gateways in setup mode don't clash.
+static const char *apSsid() {
+  static char ssid[20];
+  if (!ssid[0]) {
+    uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(ssid, sizeof ssid, "OpenOBI-%02X%02X%02X", mac[3], mac[4], mac[5]);
+  }
+  return ssid;
+}
 
 static char     g_mqttHost[64] = "";
 static uint16_t g_mqttPort = 1883;
@@ -117,7 +144,7 @@ static String statusJson() {
 // ---------------------------------------------------------------- dashboard
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>OBI LoRa Gateway</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Open OBI Energy Tracker</title>
 <style>
 :root{--bg:#0a0e14;--panel:#141a23;--panel2:#1b2430;--line:#232e3c;--txt:#eaf0f7;--dim:#7d8da0;
 --accent:#31d07a;--accent2:#12a35a;--amber:#e3b341;--red:#f0616d;--blue:#5aa9ff;
@@ -187,10 +214,13 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:26px}
 footer b{font-family:var(--mono);color:var(--txt)}
 </style></head><body>
 <header>
-<div class="htop"><div class="logo">⚡</div><div><h1>OBI LoRa Gateway</h1><div class="sub" id="sub"></div></div>
+<div class="htop"><div class="logo">⚡</div><div><h1>Open OBI Energy Tracker</h1><div class="sub" id="sub"></div></div>
 <div class="spacer"></div>
 <div class="seg"><button id="lde" onclick="setLang('de')">DE</button><button id="len" onclick="setLang('en')">EN</button></div>
-<button class="icon" onclick="tog('mq')" title="MQTT">⚙</button></div>
+<button class="icon" onclick="tog('wf')" title="Configure WiFi — scan networks and connect (no AP switch needed)">📶 WiFi</button>
+<button class="icon" onclick="tog('mq')" title="MQTT settings">⚙ MQTT</button>
+<button class="icon" onclick="location.href='/update'" title="Upload a new firmware .bin (OTA self-update)">⬆ Firmware</button>
+<button class="icon" onclick="location.href='/debug'" title="Flash hex editor / eFuses / debug">🐞 Debug</button></div>
 <div class="bar" id="bar"></div>
 </header>
 <div class="wrap">
@@ -210,6 +240,24 @@ footer b{font-family:var(--mono);color:var(--txt)}
   </div>
   <div class="sub" id="mqtt_cmd" style="margin-top:10px"></div>
  </div>
+ <div class="panel" id="wf">
+  <h2>WiFi</h2>
+  <div class="grid2">
+   <div style="grid-column:1/3"><label id="l_wnet">Network (scan)</label>
+    <div style="display:flex;gap:8px">
+     <select id="wf_ssid" style="flex:1"><option value="">— scan for networks —</option></select>
+     <button class="g" id="wf_scanb" onclick="scanWifi()">Scan</button>
+    </div></div>
+   <div><label id="l_wman">…or type SSID</label><input id="wf_manual" placeholder="MyNetwork"></div>
+   <div><label id="l_wpass">Password</label><input id="wf_pass" type="password" placeholder="••••"></div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+   <button class="b" onclick="wifiConnect()" id="wf_conn">Connect</button>
+   <button class="g" onclick="wifiPortal()" id="wf_portal">Setup portal (AP)</button>
+   <span class="sub" id="wf_msg" style="margin:0"></span>
+  </div>
+  <div class="sub" id="wf_note" style="margin-top:8px"></div>
+ </div>
  <div class="list" id="list"></div>
  <footer><span id="ft"></span> · <b id="gw"></b></footer>
 </div>
@@ -218,7 +266,7 @@ const $=s=>document.querySelector(s);
 const T={
  de:{sub:'869,5 MHz · SF7 · liest deine Zähler direkt',wifi:'WLAN',mqtt:'MQTT',radio:'Funk',readers:'Reader',
   offline:'offline',fw:'Firmware',batt:'Batterie',opt:'Sensor',active:'aktiv',nosig:'kein Signal',
-  imp:'Bezug',exp:'Einspeisung',pow:'Leistung',seen:'Zuletzt',before:'vor',setiv:'Intervall',sec:'Sek.',
+  imp:'Bezug',exp:'Einspeisung',pow:'Leistung',seen:'Zuletzt',before:'vor',setiv:'Intervall setzen',sec:'Sek.',
   del:'Reader löschen',delq:'Reader %i aus der Liste entfernen?\n\nEr ist nicht dauerhaft gesperrt — beim nächsten Empfang taucht er wieder auf.',
   none:'Noch keine Reader',waiting:'Warte auf einen Reader — Reader-Taste ~10 s halten (echtes Gateway aus).',
   uuidwait:'UUID noch unbekannt — Reader per Taste neu verbinden',
@@ -236,7 +284,7 @@ const T={
   samever:'Der Reader läuft bereits auf v%v — er akzeptiert dieselbe Version nicht (kein Reflash).\n\nTrotzdem versuchen?'},
  en:{sub:'869.5 MHz · SF7 · reading your meters directly',wifi:'WiFi',mqtt:'MQTT',radio:'Radio',readers:'Readers',
   offline:'offline',fw:'Firmware',batt:'Battery',opt:'Sensor',active:'active',nosig:'no signal',
-  imp:'Import',exp:'Export',pow:'Power',seen:'Last seen',before:'',setiv:'Interval',sec:'sec',
+  imp:'Import',exp:'Export',pow:'Power',seen:'Last seen',before:'',setiv:'Set interval',sec:'sec',
   del:'Delete reader',delq:'Remove reader %i from the list?\n\nIt is not permanently blocked — it reappears on the next reception.',
   none:'No readers yet',waiting:'Waiting for a reader — hold its button ~10 s (real gateway off).',
   uuidwait:'UUID unknown yet — reconnect the reader with its button',
@@ -257,8 +305,29 @@ function setLang(x){lang=x;L=T[x];localStorage.setItem('lang',x);applyLang();tic
 function applyLang(){$('#lde').className=lang=='de'?'act':'';$('#len').className=lang=='en'?'act':'';
  $('#sub').textContent=L.sub;$('#mqtt_h').textContent=L.mqcfg;$('#l_host').textContent=L.host;
  $('#l_port').textContent=L.port;$('#l_user').textContent=L.user;$('#l_pass').textContent=L.pass;
- $('#l_topic').textContent=L.topic;$('#b_save').textContent=L.save;$('#b_disc').textContent=L.disc;}
+ $('#l_topic').textContent=L.topic;$('#b_save').textContent=L.save;$('#b_disc').textContent=L.disc;
+ var de=lang=='de';
+ $('#l_wnet').textContent=de?'Netzwerk (Scan)':'Network (scan)';$('#wf_scanb').textContent=de?'Scannen':'Scan';
+ $('#l_wman').textContent=de?'…oder SSID eingeben':'…or type SSID';$('#l_wpass').textContent=L.pass;
+ $('#wf_conn').textContent=de?'Verbinden':'Connect';$('#wf_portal').textContent=de?'Setup-Portal (AP)':'Setup portal (AP)';
+ $('#wf_note').textContent=de?'Der Scan pausiert das Dashboard kurz. Ändert sich die IP nach dem Verbinden, öffne das Dashboard unter der neuen IP (siehe Serial-Log / E-Paper).':'Scanning briefly pauses the dashboard. If the IP changes after connecting, reopen the dashboard at the new IP (serial log / e-paper).';}
 function tog(id){$('#'+id).classList.toggle('open')}
+async function scanWifi(){$('#wf_msg').textContent=lang=='de'?'suche…':'scanning…';$('#wf_scanb').disabled=true;
+ try{let n=await(await fetch('/api/wifi/scan')).json();n.sort((a,b)=>b.rssi-a.rssi);
+  let seen={},opts='<option value="">'+(lang=='de'?'— Netzwerk wählen —':'— pick a network —')+'</option>';
+  for(let x of n){if(!x.ssid||seen[x.ssid])continue;seen[x.ssid]=1;
+   opts+='<option value="'+x.ssid.replace(/"/g,'&quot;')+'">'+x.ssid+' ('+x.rssi+' dBm)'+(x.enc?' 🔒':'')+'</option>';}
+  $('#wf_ssid').innerHTML=opts;$('#wf_msg').textContent=Object.keys(seen).length+(lang=='de'?' Netzwerke':' networks');}
+ catch(e){$('#wf_msg').textContent=lang=='de'?'Scan fehlgeschlagen':'scan failed';}
+ $('#wf_scanb').disabled=false;}
+function wifiSsid(){return $('#wf_ssid').value||$('#wf_manual').value.trim();}
+async function wifiConnect(){let s=wifiSsid();if(!s){$('#wf_msg').textContent=lang=='de'?'SSID wählen/eingeben':'pick or type an SSID';return;}
+ $('#wf_msg').textContent=(lang=='de'?'verbinde mit ':'connecting to ')+s+'…';
+ try{await fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+  body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent($('#wf_pass').value)});}catch(e){}
+ $('#wf_msg').textContent=(lang=='de'?'verbinde mit ':'connecting to ')+s+' — '+(lang=='de'?'Status oben beachten':'watch the status bar')+'.';}
+function wifiPortal(){fetch('/api/wifi',{method:'POST'}).then(r=>r.json()).then(d=>{
+ alert((lang=='de'?'Portal gestartet auf WLAN: ':'Portal started on WiFi: ')+d.ssid+'\n'+(lang=='de'?'Verbinde dich damit und öffne ':'Connect to it and open ')+'http://192.168.4.1/');}).catch(()=>{});}
 const nf=n=>n.toLocaleString(lang=='de'?'de-DE':'en-US');
 function val(v,unit){return v===null?`<span class="v na">–</span>`:`<span class="v">${nf(v)}${unit?' <small>'+unit+'</small>':''}</span>`}
 // import/export come as raw Wh -> show kWh (raw/1000) with 3 decimals
@@ -401,7 +470,250 @@ static void handleRediscover();                                          // fwd:
 static void handleDelete();                                              // fwd: drop a phantom reader from the list
 static void handleOtaCancel() { gw_ota_cancel(); server.send(200, "application/json", "{\"ok\":true}"); }
 
+// ---- ESP32 self firmware update (reflash our OWN app over WiFi) ------------
+// Every board gets this: upload the built firmware.bin from a browser and it is written into the inactive
+// OTA slot, then the device reboots into it. This is essential for the sealed OBI_BOARD_OBI_C3 (locked
+// bootloader, no UART) — without a built-in OTA path the first custom flash would be one-way — and handy
+// on the Heltec/T-Beam/generic boards too (update without plugging in USB). Page: http://<device-ip>/update
+static bool s_selfOtaOk = false;
+static void handleSelfOtaUpload() {
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    s_selfOtaOk = Update.begin(UPDATE_SIZE_UNKNOWN);        // grow into the whole free OTA partition
+    if (!s_selfOtaOk) Update.printError(Serial);
+    Serial.printf("[selfota] start: %s\n", up.filename.c_str());
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (s_selfOtaOk && Update.write(up.buf, up.currentSize) != up.currentSize) {
+      Update.printError(Serial); s_selfOtaOk = false;
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (s_selfOtaOk && !Update.end(true)) { Update.printError(Serial); s_selfOtaOk = false; }
+    else if (s_selfOtaOk) Serial.printf("[selfota] ok, %u bytes — rebooting\n", up.totalSize);
+  }
+}
+static void handleSelfOtaDone() {
+  bool ok = s_selfOtaOk && !Update.hasError();
+  server.sendHeader("Connection", "close");
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+  if (ok) { delay(300); ESP.restart(); }
+}
+static void handleUpdatePage() {   // firmware self-update uploader (dark theme, upload progress)
+  server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Firmware Update</title><style>
+:root{--bg:#0b0f0c;--panel:#121814;--panel2:#161d18;--line:#26332b;--txt:#d7e0d8;--dim:#8aa;--accent:#39e08a;--mono:ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box}body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
+header{display:flex;align-items:center;gap:12px;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+header b{font-size:15px}header a{color:var(--accent);text-decoration:none;font-size:13px;margin-left:auto}
+.card{max-width:34rem;margin:26px auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}
+h3{margin:0 0 4px}.dim{color:var(--dim);font-size:13px;line-height:1.5}
+input[type=file]{width:100%;margin:14px 0;background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:10px;font-family:var(--mono);font-size:13px}
+button{background:var(--accent);border:0;color:#052012;font-weight:700;border-radius:9px;padding:10px 18px;cursor:pointer;font-size:14px}
+button:disabled{opacity:.5;cursor:default}
+.bar{height:10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:16px 0 6px;display:none}
+.bar.on{display:block}.fill{height:100%;width:0;background:var(--accent);transition:width .15s}
+#st{font-family:var(--mono);font-size:13px;min-height:18px}code{color:var(--accent)}
+</style></head><body>
+<header><b>Open OBI Energy Tracker · ⬆ Firmware Update</b><a href="/">← dashboard</a></header>
+<div class=card><h3>Flash a new firmware</h3>
+<p class=dim>Upload this board's <code>firmware.bin</code>. It is written to the inactive OTA slot and the device reboots into it; a bad image is rejected and the current firmware keeps running.</p>
+<input type=file id=f accept=.bin>
+<div class=bar id=bar><div class=fill id=fill></div></div>
+<div id=st></div>
+<p><button id=go onclick=up()>Flash &amp; reboot</button></p></div>
+<script>
+const $=i=>document.getElementById(i);
+function up(){let f=$('f').files[0];if(!f){$('st').textContent='pick a .bin first';return;}
+$('go').disabled=true;$('bar').classList.add('on');$('st').textContent='uploading '+f.name+' ('+(f.size/1024|0)+' KB)...';
+let fd=new FormData();fd.append('firmware',f);let x=new XMLHttpRequest();x.open('POST','/api/selfupdate');
+x.upload.onprogress=e=>{if(e.lengthComputable){let p=e.loaded/e.total*100;$('fill').style.width=p+'%';$('st').textContent='uploading '+(p|0)+'%';}};
+x.onload=()=>{let ok=false;try{ok=JSON.parse(x.responseText).ok;}catch(e){}
+$('fill').style.width='100%';$('st').textContent=ok?'written - device is rebooting into the new firmware...':'update failed (image rejected). Current firmware kept.';
+if(ok)setTimeout(()=>location.href='/',9000);else $('go').disabled=false;};
+x.onerror=()=>{$('st').textContent='connection lost (device may be rebooting)';setTimeout(()=>location.href='/',9000);};
+x.send(fd);}
+</script></body></html>)HTML");
+}
+
+// ---- flash debug: raw read / patch / erase over HTTP (backs the /debug hex editor, all boards) -------
+static const char FDBG_HEXCH[] = "0123456789ABCDEF";
+
+static void handleFlashInfo() {
+  String j = "{\"size\":" + String(flash_dbg_size()) + ",\"parts\":[";
+  esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
+  bool first = true;
+  for (; it; it = esp_partition_next(it)) {
+    const esp_partition_t *p = esp_partition_get(it);
+    j += (first ? "" : ",");
+    first = false;
+    j += "{\"label\":\"" + String(p->label) + "\",\"sub\":" + String(p->subtype) +
+         ",\"off\":" + String(p->address) + ",\"size\":" + String(p->size) + "}";
+  }
+  esp_partition_iterator_release(it);
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+static void handleFlashRead() {
+  uint32_t addr = strtoul(server.arg("addr").c_str(), nullptr, 0);
+  uint32_t len  = strtoul(server.arg("len").c_str(), nullptr, 0);
+  if (!len) len = 256;
+  if (len > 4096) len = 4096;                      // bound the response; the UI reads larger in chunks
+  uint8_t *buf = (uint8_t *)malloc(len);
+  if (!buf) { server.send(500, "application/json", "{\"ok\":false}"); return; }
+  bool ok = flash_dbg_read(addr, buf, len);
+  String hex; hex.reserve(len * 2 + 1);
+  for (uint32_t i = 0; i < len; i++) { hex += FDBG_HEXCH[buf[i] >> 4]; hex += FDBG_HEXCH[buf[i] & 15]; }
+  free(buf);
+  server.send(200, "application/json",
+    "{\"ok\":" + String(ok ? "true" : "false") + ",\"addr\":" + String(addr) +
+    ",\"len\":" + String(len) + ",\"hex\":\"" + hex + "\"}");
+}
+static void handleFlashPatch() {
+  uint32_t addr = strtoul(server.arg("addr").c_str(), nullptr, 0);
+  String data = server.arg("data");
+  int bytes = data.length() / 2;
+  if (bytes <= 0 || bytes > 4096) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  uint8_t *buf = (uint8_t *)malloc(bytes);
+  if (!buf) { server.send(500, "application/json", "{\"ok\":false}"); return; }
+  for (int i = 0; i < bytes; i++) buf[i] = (uint8_t)strtol(data.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+  bool ok = flash_dbg_patch(addr, buf, bytes);
+  free(buf);
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+static void handleFlashErase() {
+  uint32_t addr = strtoul(server.arg("addr").c_str(), nullptr, 0);
+  uint32_t len  = strtoul(server.arg("len").c_str(), nullptr, 0);
+  if (!len) len = 4096;
+  bool ok = flash_dbg_erase(addr, len);
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+static void handleEfuse() { server.send(200, "application/json", flash_dbg_efuse_json()); }
+static void handleDebugPage() {
+  server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Flash Debug</title><style>
+:root{--bg:#0b0f0c;--panel:#121814;--panel2:#161d18;--line:#26332b;--txt:#d7e0d8;--dim:#8aa;--accent:#39e08a;--amber:#ffd166;--red:#ff6b6b;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{box-sizing:border-box}body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
+header{display:flex;align-items:center;gap:12px;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+header b{font-size:15px}header a{color:var(--accent);text-decoration:none;font-size:13px}.sp{flex:1}
+.bar{display:flex;gap:7px;flex-wrap:wrap;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:47px;z-index:4}
+input,select,button{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 9px;font-family:var(--mono);font-size:13px}
+input:focus,select:focus{outline:1px solid var(--accent)}button{cursor:pointer}
+button.p{background:var(--accent);border-color:var(--accent);color:#052012;font-weight:700}
+button.d{background:#3a1414;border-color:#5c2020;color:#ffbcbc}button.d:hover{background:#521c1c}
+#addr{width:112px}.lbl{color:var(--dim);font-size:12px}
+.warn{color:#ffb4b4;font-size:12px;padding:8px 16px;background:#1c1210;border-bottom:1px solid #3a2320}
+.hexwrap{overflow:auto;max-height:calc(100vh - 210px)}
+table.hex{border-collapse:collapse;font-family:var(--mono);font-size:13px;white-space:nowrap}
+table.hex thead th{position:sticky;top:0;background:var(--panel);color:var(--dim);font-weight:600;padding:5px 4px;border-bottom:1px solid var(--line);text-align:center}
+table.hex td{padding:0 2px;text-align:center}td.off{color:var(--accent);padding:0 10px 0 14px;text-align:right;user-select:all}
+.hx{width:24px;text-align:center;background:transparent;border:1px solid transparent;border-radius:4px;color:var(--txt);font-family:inherit;font-size:13px;padding:2px 0}
+.hx:focus{outline:none;border-color:var(--accent)}.hx.ch{color:#052012;background:var(--amber);font-weight:700}
+.hx.z{color:#556}td.gap{padding:0 6px}.ascw{padding-left:12px;text-align:left!important;letter-spacing:1px}
+.ac{color:#9fb4a6}.ac.np{color:#4a5}.hi{background:#274!important;color:#fff!important;border-radius:3px}
+.hx.hi{background:#2b4a6b!important;color:#fff!important}
+#insp{display:flex;gap:16px;flex-wrap:wrap;padding:8px 16px;background:var(--panel);border-top:1px solid var(--line);font-family:var(--mono);font-size:12px;position:sticky;bottom:0}
+#insp b{color:var(--accent)}#insp span{color:var(--dim)}
+#efuse{display:none;padding:10px 16px;background:var(--panel2);border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12.5px}
+#efuse.show{display:block}#efuse table{border-collapse:collapse}#efuse td{padding:2px 14px 2px 0}
+.ok{color:var(--accent)}.bad{color:var(--red);font-weight:700}
+#msg{color:#9fd;font-size:12px;margin-left:4px}
+</style></head><body>
+<header><b>Open OBI Energy Tracker · 🐞 Flash Debug</b><span class=lbl id=chip></span><span class=sp></span>
+<a href="/update">firmware ⬆</a><a href="/">← dashboard</a></header>
+<div class=bar>
+<span class=lbl>addr</span><input id=addr value=0x0><button onclick=go()>Go</button>
+<button onclick=page(-1)>◀</button><button onclick=page(1)>▶</button>
+<select id=vlen><option>256<option selected>512<option>1024<option>2048<option>4096</select>
+<select id=parts onchange=jump()></select>
+<button class=p onclick=doWrite()>Write <span id=ec>0</span></button>
+<button class=d onclick=doErase()>Erase sector</button>
+<button onclick=doSave()>Save .bin</button><button class=p onclick=dumpAll()>Dump full flash</button><button onclick=efuse()>eFuses</button>
+<span id=msg></span></div>
+<div class=warn>⚠ Raw flash — writing the wrong offset (bootloader 0x0, partition table 0x8000, running app) can brick the device. Only edited (yellow) bytes are written: read-modify-erase-write per 4 KB sector.</div>
+<div id=efuse></div>
+<div class=hexwrap><table class=hex><thead><tr id=head></tr></thead><tbody id=body></tbody></table></div>
+<div id=insp><span>click a byte</span></div>
+<script>
+const $=i=>document.getElementById(i);
+const h2=n=>n.toString(16).toUpperCase().padStart(2,'0'),h8=n=>('00000000'+n.toString(16).toUpperCase()).slice(-8);
+let SIZE=0,base=0,vlen=512,data=new Uint8Array(0),edits={},hi=null;
+const api=(u,o)=>fetch(u,o).then(r=>r.json());
+function msg(t){$('msg').textContent=t;}
+function esc(v){if(v<32||v>126)return'.';return v===38?'&amp;':v===60?'&lt;':v===62?'&gt;':String.fromCharCode(v);}
+function ecount(){let n=Object.keys(edits).length;$('ec').textContent=n;}
+function getb(a){let v=edits[a];if(v!==undefined)return v;let i=a-base;return(i>=0&&i<data.length)?data[i]:undefined;}
+async function loadInfo(){let r=await api('/api/flash/info');SIZE=r.size;
+$('parts').innerHTML='<option value="">— partition —</option>'+r.parts.map(p=>`<option value="${p.off}:${p.size}">${p.label} @0x${p.off.toString(16)} · ${p.size/1024|0}K</option>`).join('');
+let hh='<th>OFFSET</th>';for(let i=0;i<16;i++)hh+=`<th class="${i==8?'gap':''}">${h2(i)}</th>`;hh+='<th class=ascw>ASCII</th>';$('head').innerHTML=hh;
+msg('flash '+(SIZE/1024|0)+'K');}
+async function read(){vlen=+$('vlen').value;data=new Uint8Array(vlen);
+for(let o=0;o<vlen;o+=4096){let n=Math.min(4096,vlen-o);let r=await api(`/api/flash/read?addr=${base+o}&len=${n}`);
+if(!r.ok){msg('read failed');return;}for(let i=0;i<n;i++)data[o+i]=parseInt(r.hex.substr(i*2,2),16);}
+render();msg(`@0x${base.toString(16)} · ${vlen} B`);}
+function render(){let rows='';for(let o=0;o<data.length;o+=16){let cells='',asc='';
+for(let i=0;i<16;i++){let a=base+o+i,v=getb(a),ed=edits[a]!==undefined;
+let cl='hx'+(ed?' ch':(v===0?' z':''));
+cells+=`<td class="${i==8?'gap':''}"><input class="${cl}" maxlength=2 data-a=${a} value=${h2(v)}></td>`;
+asc+=`<span class="ac${(v<32||v>126)?' np':''}" data-a=${a}>${esc(v)}</span>`;}
+rows+=`<tr><td class=off>${h8(base+o)}</td>${cells}<td class=ascw>${asc}</td></tr>`;}
+$('body').innerHTML=rows;ecount();}
+function go(){let a=parseInt($('addr').value)||0;base=Math.max(0,Math.min(a,SIZE-16))&~0xf;$('addr').value='0x'+base.toString(16);read();}
+function page(d){base=Math.max(0,Math.min(base+d*vlen,(SIZE-vlen)&~0xf));$('addr').value='0x'+base.toString(16);read();}
+function jump(){let v=$('parts').value;if(!v)return;base=+v.split(':')[0]&~0xf;$('addr').value='0x'+base.toString(16);read();}
+$('vlen').onchange=read;
+// edit + select + hover via delegation
+$('body').addEventListener('input',e=>{if(!e.target.classList.contains('hx'))return;
+let a=+e.target.dataset.a,v=parseInt(e.target.value,16);if(isNaN(v))return;v&=255;
+let base0=(a-base>=0&&a-base<data.length)?data[a-base]:0;
+if(v===base0)delete edits[a];else edits[a]=v;
+e.target.classList.toggle('ch',edits[a]!==undefined);
+let ac=$('body').querySelector(`.ac[data-a="${a}"]`);if(ac){ac.innerHTML=esc(v);ac.classList.toggle('np',v<32||v>126);}
+ecount();});
+$('body').addEventListener('focusin',e=>{if(e.target.dataset.a)inspect(+e.target.dataset.a);});
+$('body').addEventListener('mouseover',e=>{let a=e.target.dataset.a;if(!a||a===hi)return;paint(hi,false);paint(a,true);hi=a;});
+function paint(a,on){if(a==null)return;$('body').querySelectorAll(`[data-a="${a}"]`).forEach(x=>x.classList.toggle('hi',on));}
+function inspect(a){let v=getb(a);if(v===undefined){$('insp').innerHTML='<span>—</span>';return;}
+let v16=getb(a),v16b=getb(a+1),u16=(v16b<<8|v16)>>>0;
+let b=[getb(a),getb(a+1),getb(a+2),getb(a+3)],u32=b.some(x=>x===undefined)?null:((b[3]<<24|b[2]<<16|b[1]<<8|b[0])>>>0);
+$('insp').innerHTML=`<b>0x${h8(a)}</b><span>u8</span> 0x${h2(v)} · ${v} · ${v.toString(2).padStart(8,'0')} · '${esc(v)}'`+
+`<span>u16 LE</span> 0x${u16.toString(16).toUpperCase()} · ${u16}`+(u32!==null?`<span>u32 LE</span> 0x${u32.toString(16).toUpperCase()} · ${u32}`:'');}
+async function doWrite(){let ks=Object.keys(edits).map(Number).sort((a,b)=>a-b);if(!ks.length){msg('no edits');return;}
+if(!confirm('Write '+ks.length+' byte(s) to flash?'))return;
+let runs=[],cur=null;for(let k of ks){if(cur&&k===cur.off+cur.data.length)cur.data.push(edits[k]);else{cur={off:k,data:[edits[k]]};runs.push(cur);}}
+for(let r of runs){let hex=r.data.map(h2).join('');
+let j=await api('/api/flash/patch',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'addr='+r.off+'&data='+hex});
+if(!j.ok){msg('write FAILED @0x'+r.off.toString(16));return;}}
+edits={};msg('wrote '+ks.length+' byte(s)');read();}
+async function doErase(){let s=(parseInt($('addr').value)||base)&~0xfff;if(!confirm('Erase 4 KB sector @0x'+s.toString(16)+'?'))return;
+let j=await api('/api/flash/erase',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'addr='+s+'&len=4096'});
+msg(j.ok?'erased 0x'+s.toString(16):'erase failed');if(j.ok)read();}
+async function doSave(){let n=parseInt(prompt('Bytes to read & save from 0x'+base.toString(16),SIZE-base));if(!n)return;
+let out=new Uint8Array(n);for(let o=0;o<n;o+=4096){let m=Math.min(4096,n-o);let r=await api(`/api/flash/read?addr=${base+o}&len=${m}`);
+for(let i=0;i<m;i++)out[o+i]=parseInt(r.hex.substr(i*2,2),16);msg('reading '+(o+m)+'/'+n);}
+let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([out]));a.download='flash_0x'+base.toString(16)+'_'+n+'.bin';a.click();msg('saved '+n+' B');}
+async function dumpAll(){if(!SIZE){msg('flash size unknown');return;}
+if(!confirm('Read the ENTIRE '+(SIZE/1024|0)+' KB flash (bootloader + partition table + all apps + NVS) and download it? This can take a while over WiFi.'))return;
+let out=new Uint8Array(SIZE);for(let o=0;o<SIZE;o+=4096){let m=Math.min(4096,SIZE-o);
+let r=await api(`/api/flash/read?addr=${o}&len=${m}`);if(!r.ok){msg('dump failed @0x'+o.toString(16));return;}
+for(let i=0;i<m;i++)out[o+i]=parseInt(r.hex.substr(i*2,2),16);
+if((o&0x3ffff)===0||o+m>=SIZE)msg('dumping '+((o+m)/1024|0)+'/'+(SIZE/1024|0)+' KB...');}
+let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([out]));a.download='flash_full_'+(SIZE/1024|0)+'k.bin';a.click();msg('dumped full flash ('+SIZE+' bytes)');}
+async function efuse(){let e=$('efuse');if(e.classList.contains('show')){e.classList.remove('show');return;}
+let r=await api('/api/efuse');$('chip').textContent=r.chip+' rev'+r.rev+' · '+r.mac;
+let rows=Object.entries(r.fuses).map(([k,v])=>`<td>${k}</td><td class="${v?'bad':'ok'}">${v}</td>`);
+let dl=r.dl_locked?'<span class=bad>DISABLED (locked)</span>':'<span class=ok>available</span>';
+let html=`<b>${r.chip} rev${r.rev}</b> · MAC ${r.mac} · ROM download mode: ${dl}<table>`;
+for(let i=0;i<rows.length;i+=2)html+='<tr>'+rows[i]+(rows[i+1]||'')+'</tr>';
+e.innerHTML=html+'</table>';e.classList.add('show');}
+document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.id!=='addr')return;
+if(e.key==='PageDown'){page(1);e.preventDefault();}else if(e.key==='PageUp'){page(-1);e.preventDefault();}});
+loadInfo().then(read);
+</script></body></html>)HTML");
+}
+
 // ---------------------------------------------------------------- services
+static void handleWifiPortal();   // fwd: /api/wifi -> open the WiFiManager portal on demand
+static void handleWifiScan();     // fwd: /api/wifi/scan
+static void handleWifiConnect();  // fwd: /api/wifi/connect
 static void startServices() {
   if (g_serverUp) return;
   strlcpy(g_mqttHost, pHost->getValue(), sizeof g_mqttHost);
@@ -414,21 +726,96 @@ static void startServices() {
   prefs.putString("u", g_mqttUser); prefs.putString("pw", g_mqttPass); prefs.putString("t", g_mqttTopic);
   prefs.end();
 
+  static bool routesReg = false;
+  if (!routesReg) {   // register routes once — startServices() may run again after the WiFi portal closes
+  routesReg = true;
   server.on("/", handleIndex);
   server.on("/api/readers", handleReaders);
   server.on("/api/status", handleStatus);
   server.on("/api/interval", HTTP_POST, handleInterval);
   server.on("/api/mqtt", HTTP_POST, handleMqttCfg);
+  server.on("/api/wifi", HTTP_POST, handleWifiPortal);        // open the on-demand WiFiManager portal (AP)
+  server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);      // list nearby networks (dashboard panel)
+  server.on("/api/wifi/connect", HTTP_POST, handleWifiConnect); // connect to a chosen network in-place
   server.on("/api/rediscover", HTTP_POST, handleRediscover);
   server.on("/api/delete", HTTP_POST, handleDelete);
-  server.on("/api/ota", HTTP_POST, handleOtaDone, handleOtaUpload);   // multipart .bin upload
+  server.on("/api/ota", HTTP_POST, handleOtaDone, handleOtaUpload);   // reader firmware over LoRa
   server.on("/api/ota_cancel", HTTP_POST, handleOtaCancel);
+  server.on("/update", HTTP_GET, handleUpdatePage);                   // ESP32 self-update page
+  server.on("/api/selfupdate", HTTP_POST, handleSelfOtaDone, handleSelfOtaUpload);
+  server.on("/debug", HTTP_GET, handleDebugPage);                     // flash hex editor
+  server.on("/api/flash/info",  HTTP_GET,  handleFlashInfo);
+  server.on("/api/flash/read",  HTTP_GET,  handleFlashRead);
+  server.on("/api/flash/patch", HTTP_POST, handleFlashPatch);
+  server.on("/api/flash/erase", HTTP_POST, handleFlashErase);
+  server.on("/api/efuse",       HTTP_GET,  handleEfuse);
+  }   // end one-time route registration
   server.begin();
   mqtt.setServer(g_mqttHost, g_mqttPort);
   mqtt.setBufferSize(768);          // HA discovery configs (with device block) exceed the 256B default
   mqtt.setCallback(mqttCallback);          // <base>/<id>/set_interval command topic
-  g_serverUp = true; g_wifiOk = true;
-  Serial.printf("[web] WiFi ok, dashboard: http://%s/\n", WiFi.localIP().toString().c_str());
+  bool sta = WiFi.status() == WL_CONNECTED;
+  g_serverUp = true; g_wifiOk = sta;
+  Serial.printf("[web] dashboard up: http://%s/  (%s)\n",
+                (sta ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str(),
+                sta ? "connected" : "setup AP — use the WiFi button to configure");
+}
+
+// Button endpoint: request the on-demand WiFi portal. We only flag it here and answer immediately;
+// webTask actually launches it (it must stop our server first — both want port 80).
+static void handleWifiPortal() {
+  server.send(200, "application/json", String("{\"ok\":true,\"ssid\":\"") + apSsid() + "\"}");
+  g_portalReq = true;
+}
+
+// Scan for WiFi networks (works while connected, in STA or AP+STA). Synchronous — pauses the web task a
+// couple of seconds. Returns [{ssid,rssi,enc}]. Backs the dashboard WiFi panel's "Scan" button.
+static void handleWifiScan() {
+  int n = WiFi.scanNetworks();
+  String j = "[";
+  for (int i = 0; i < n; i++) {
+    String s = WiFi.SSID(i);
+    s.replace("\\", "\\\\"); s.replace("\"", "\\\"");
+    if (i) j += ",";
+    j += "{\"ssid\":\"" + s + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+         ",\"enc\":" + String(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? 0 : 1) + "}";
+  }
+  j += "]";
+  WiFi.scanDelete();
+  server.send(200, "application/json", j);
+}
+
+// Connect to a network chosen in the dashboard (no AP switch needed when already connected). We answer
+// BEFORE calling WiFi.begin(), because begin() drops the current link. Credentials persist to NVS, so
+// autoConnect() uses them on the next boot. The webTask connect/disconnect watcher updates AP + state.
+static void handleWifiConnect() {
+  String ssid = server.arg("ssid"), pass = server.arg("pass");
+  if (!ssid.length()) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"ssid\"}"); return; }
+  server.send(200, "application/json", "{\"ok\":true}");
+  Serial.printf("[web] dashboard: connecting to '%s'\n", ssid.c_str());
+  WiFi.persistent(true);
+  if (WiFi.getMode() == WIFI_MODE_AP) WiFi.mode(WIFI_AP_STA);   // keep AP up during the switch
+  WiFi.begin(ssid.c_str(), pass.c_str());
+}
+
+// Launch the WiFiManager config portal on demand (from webTask). Frees port 80 for WiFiManager, runs the
+// portal (blocking, 3-min timeout) on the 'OpenOBI-<MAC>' AP, then brings our dashboard back up. Works
+// both when unconfigured (already in AP mode) and when connected (lets you re-point WiFi/MQTT anytime).
+static void runPortal() {
+  Serial.printf("[web] opening WiFi config portal on AP '%s' (192.168.4.1)\n", apSsid());
+  server.stop();
+  g_serverUp = false;
+  mqtt.disconnect();
+  wm.setEnableConfigPortal(true);
+  wm.setConfigPortalBlocking(true);
+  wm.setConfigPortalTimeout(180);
+  wm.startConfigPortal(apSsid());          // serves the WiFiManager UI until saved or 3-min timeout
+  wm.setConfigPortalBlocking(false);
+  wm.setConfigPortalTimeout(0);
+  if (WiFi.status() != WL_CONNECTED) { WiFi.mode(WIFI_AP_STA); WiFi.softAP(apSsid()); g_apActive = true; }
+  else g_apActive = false;                 // connected -> no setup AP needed
+  startServices();                         // dashboard back up (STA IP or 192.168.4.1)
+  Serial.println("[web] WiFi portal closed — dashboard restored");
 }
 
 // ---- MQTT command RX: publish "<seconds>" to <base>/<id>/set_interval ------
@@ -613,6 +1000,107 @@ static void mqttService() {
   }
 }
 
+#ifdef OBI_HAS_EPD
+// ---- on-board e-paper (Heltec Vision Master E290) --------------------------
+// Shows gateway status + a line per reader. Runs on the web task (core 0), so it
+// never touches LoRa timing (core 1). E-paper is slow and wears with refreshes, so we
+// only redraw when the shown content actually changes (throttled), use a flicker-free
+// partial refresh for updates, and a full refresh now and then to clear ghosting.
+static void epdInit() {
+  pinMode(PIN_EINK_VEXT, OUTPUT);
+  digitalWrite(PIN_EINK_VEXT, HIGH);            // power the panel (active HIGH)
+  delay(50);
+  epdSPI.begin(PIN_EINK_SCLK, -1, PIN_EINK_MOSI, -1);
+  epd.init(115200, true, 2, false, epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  epd.setRotation(3);                           // landscape 296x128 (E290 ribbon at top)
+  epd.setTextColor(GxEPD_BLACK);
+  epd.setTextWrap(false);
+  g_epdOk = true;
+}
+
+// raw-Wh energy field -> compact kWh string ("--" when n/a)
+static String epdKwh(uint32_t v) { return obi_na(v) ? String("--") : String(v / 1000.0, 1); }
+
+// used readers, sorted by 3-byte handle — same stable order as the web UI so rows never jump
+static int epdSortedOrder(int order[]) {
+  int n = 0;
+  for (int i = 0; i < MAX_READERS; i++) if (readers[i].used) order[n++] = i;
+  for (int a = 0; a < n - 1; a++)
+    for (int b = 0; b < n - 1 - a; b++)
+      if (memcmp(readers[order[b]].handle, readers[order[b + 1]].handle, 3) > 0) {
+        int t = order[b]; order[b] = order[b + 1]; order[b + 1] = t;
+      }
+  return n;
+}
+
+// signature of the *shown* state — a redraw only happens when this changes
+static String epdSignature() {
+  String s = (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("ap")) +
+             (g_mqttUp ? "|1" : "|0");
+  int order[MAX_READERS], n = epdSortedOrder(order);
+  for (int k = 0; k < n; k++) {
+    Reader &r = readers[order[k]];
+    s += "|" + hex(r.handle, 3) + ":" + jnum(r.import_) + ":" + jnum(r.export_) + ((r.flags & 1) ? "i" : "");
+  }
+  return s;
+}
+
+static void epdRender() {
+  int order[MAX_READERS], n = epdSortedOrder(order);
+  epd.firstPage();
+  do {
+    epd.fillScreen(GxEPD_WHITE);
+    epd.setTextSize(2); epd.setCursor(2, 2);   epd.print("Open OBI Energy Tracker");
+    epd.setTextSize(1);
+    epd.drawFastHLine(0, 20, epd.width(), GxEPD_BLACK);
+    epd.setCursor(2, 25);
+    if (WiFi.status() == WL_CONNECTED) epd.printf("WiFi %s", WiFi.localIP().toString().c_str());
+    else                               epd.printf("AP: %s / 192.168.4.1", apSsid());
+    epd.setCursor(2, 37);
+    epd.printf("MQTT %s   Reader %d",
+               g_mqttUp ? "connected" : (g_mqttHost[0] ? "offline" : "off"), n);
+    epd.drawFastHLine(0, 49, epd.width(), GxEPD_BLACK);
+    int y = 54;
+    if (!n) { epd.setCursor(2, y); epd.print("waiting for a reader..."); }
+    for (int k = 0; k < n && y < epd.height() - 6; k++) {
+      Reader &r = readers[order[k]];
+      int batt = constrain((r.battery_mV - 2400) / 8, 0, 100);
+      epd.setCursor(2, y);
+      epd.printf("%s  %s/%s kWh  %s  %ddBm  %d%%",
+                 hex(r.handle, 3).c_str(), epdKwh(r.import_).c_str(), epdKwh(r.export_).c_str(),
+                 (r.flags & 1) ? "IR" : "--", (int)r.lastRssi, batt);
+      y += 12;
+    }
+  } while (epd.nextPage());
+}
+
+static void epdUpdate(bool force) {
+  if (!g_epdOk) return;
+  static uint32_t lastRefresh = 0;
+  static String   lastSig;
+  uint32_t now = millis();
+  String sig = epdSignature();
+  if (!force) {
+    if (sig == lastSig) return;                 // nothing on screen would change
+    if (now - lastRefresh < 15000) return;      // don't hammer the (slow, wearing) panel
+  }
+  epd.setFullWindow();                          // always a clean full refresh (partial ghosts on this panel)
+  epdRender();
+  lastSig = sig; lastRefresh = now;
+}
+
+// The panel refresh is a multi-second, busy-waiting operation, so it lives in its OWN task on its OWN SPI
+// bus — otherwise it stalls the dashboard/MQTT loop. It only reads shared state (readers, WiFi, g_mqttUp).
+static void epdTask(void *) {
+  epdInit();
+  epdUpdate(true);                              // first full draw
+  for (;;) {
+    epdUpdate(false);                           // internally signature-gated + rate-limited to 15 s
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+#endif // OBI_HAS_EPD
+
 // ---------------------------------------------------------------- task
 static void webTask(void *) {
   prefs.begin("obigw", true);
@@ -633,16 +1121,57 @@ static void webTask(void *) {
   wm.addParameter(pPass); wm.addParameter(pTopic);
   wm.setConfigPortalBlocking(false);
   wm.setConfigPortalTimeout(0);
-  Serial.println("[web] WiFi: joining saved network or opening portal 'OBI-Gateway-Setup' (192.168.4.1)");
-  if (wm.autoConnect("OBI-Gateway-Setup")) startServices();
+  wm.setEnableConfigPortal(false);   // never auto-launch the portal — it's on-demand (WiFi button / runPortal)
+  wm.setCaptivePortalEnable(false);  // no DNS-hijack redirect -> the OS won't auto-pop a captive window
+  wm.setBreakAfterConfig(true);
+  Serial.printf("[web] WiFi: trying saved network (dashboard stays reachable either way, AP '%s')\n", apSsid());
+  if (!wm.autoConnect(apSsid())) {   // try saved creds only; on failure bring up our own AP for the dashboard
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(apSsid());
+    g_apActive = true;
+    Serial.printf("[web] no WiFi yet — dashboard on setup AP '%s' at http://192.168.4.1/\n", apSsid());
+  }
+  startServices();                   // dashboard is ALWAYS up (connected STA or the setup AP)
+#ifdef OBI_HAS_EPD
+  xTaskCreatePinnedToCore(epdTask, "epd", 4096, nullptr, 1, nullptr, 1);   // slow panel refresh off this loop
+#endif
 
   for (;;) {
-    wm.process();
-    if (!g_serverUp && WiFi.status() == WL_CONNECTED) startServices();
-    if (g_serverUp) { server.handleClient(); mqttService(); }
+    if (g_portalReq) { g_portalReq = false; runPortal(); }   // WiFi button pressed -> open the WM portal
+    // Watch WiFi transitions (e.g. after an in-dashboard connect): drop the setup AP once connected,
+    // raise it again if WiFi is lost — so the dashboard is always reachable (STA IP or 192.168.4.1).
+    bool conn = WiFi.status() == WL_CONNECTED;
+    if (conn != g_wifiOk) {
+      g_wifiOk = conn;
+      if (conn) {
+        if (g_apActive) { WiFi.softAPdisconnect(true); g_apActive = false; }
+        mqtt.setServer(g_mqttHost, g_mqttPort);
+        Serial.printf("[web] connected: http://%s/\n", WiFi.localIP().toString().c_str());
+      } else if (!g_apActive) {
+        WiFi.mode(WIFI_AP_STA); WiFi.softAP(apSsid()); g_apActive = true;
+        Serial.printf("[web] WiFi lost — setup AP '%s' back up at 192.168.4.1\n", apSsid());
+      }
+    }
+    if (g_serverUp) {
+      server.handleClient();
+      if (conn) mqttService();                                // no MQTT attempts while on the setup AP
+    }
+    g_mqttUp = conn && mqtt.connected();                      // cache for the e-paper task (owns PubSubClient here)
     vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 
 void web_setup() { xTaskCreatePinnedToCore(webTask, "web", 12288, nullptr, 1, nullptr, 0); }
 void web_loop() {}
+bool web_wifi_connected() { return WiFi.status() == WL_CONNECTED; }
+
+// Wipe the network config so the device comes back up in the setup captive portal. Used by the
+// case-button factory reset (main.cpp) — the only user input available on a closed, non-reflashable
+// unit. Clears WiFiManager's saved SSID/PSK and our MQTT settings; the caller reboots afterwards.
+void web_factory_reset() {
+  wm.resetSettings();                 // erase saved WiFi credentials (WiFiManager NVS)
+  prefs.begin("obigw", false);        // erase MQTT host/port/user/pass/topic
+  prefs.clear();
+  prefs.end();
+  Serial.println("[web] factory reset: WiFi + MQTT settings cleared");
+}

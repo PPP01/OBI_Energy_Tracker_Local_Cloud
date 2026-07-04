@@ -25,6 +25,8 @@
 #include "obi_ecdh.h"
 #include "reader.h"
 #include "gateway_web.h"
+#include "flash_dbg.h"
+#include "status_led.h"
 #include <Preferences.h>
 
 // ---- reversed OBI radio configuration --------------------------------------
@@ -440,6 +442,7 @@ static void handleRx() {
   radio.startReceive();
   if (st != RADIOLIB_ERR_NONE || len < 4) return;
 
+  led_blip();                        // brief LED flash on any received LoRa frame (activity indicator)
   float rssi = radio.getRSSI();
   uint8_t handle[3] = { buf[0], buf[1], buf[2] };
 
@@ -583,12 +586,70 @@ static void handleRx() {
   }
 }
 
+// ============ case button — factory reset (closed-case units) ============
+// The original OBI gateway (OBI_BOARD_OBI_C3) is a sealed enclosure with a single button and a locked
+// bootloader: once custom firmware is delivered over the cloud OTA path there is no UART/JTAG to fix a
+// wrong WiFi/MQTT config. So the button is the escape hatch: hold it >= 5 s to wipe WiFi + MQTT + the
+// stored reader UUIDs and reboot into the 'OpenOBI-<MAC>' captive portal. A short tap does nothing.
+// Compiled only when the selected board defines PIN_BUTTON (see board_config.h).
+#ifdef PIN_BUTTON
+#ifndef OBI_RESET_HOLD_MS
+#define OBI_RESET_HOLD_MS 5000
+#endif
+
+volatile bool g_btnArming = false;   // true while the reset button is held past the "arming" point
+
+static inline bool buttonPressed() {
+#if defined(BUTTON_ACTIVE_LOW) && BUTTON_ACTIVE_LOW
+  return digitalRead(PIN_BUTTON) == LOW;
+#else
+  return digitalRead(PIN_BUTTON) == HIGH;
+#endif
+}
+
+static void doFactoryReset() {
+  Serial.println("\n[btn] factory reset — wiping WiFi + MQTT + reader list");
+  g_uuidStore.begin("obiuuid", false); g_uuidStore.clear(); g_uuidStore.end();  // stored reader UUIDs
+  web_factory_reset();                                                          // WiFi + MQTT settings
+  for (int i = 0; i < 20; i++) { led_write(i & 1); delay(100); }                // ~2 s blink = confirmed
+  Serial.println("[btn] done — rebooting into setup portal");
+  delay(200);
+  ESP.restart();
+}
+
+static void buttonSetup() {
+#if defined(BUTTON_ACTIVE_LOW) && BUTTON_ACTIVE_LOW
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+#else
+  pinMode(PIN_BUTTON, INPUT_PULLDOWN);
+#endif
+  Serial.printf("button: GPIO%d (hold %ds -> factory reset)\n", PIN_BUTTON, OBI_RESET_HOLD_MS / 1000);
+}
+
+static void buttonLoop() {
+  static uint32_t pressStart = 0;
+  static bool triggered = false;
+  if (buttonPressed()) {
+    uint32_t now = millis();
+    if (!pressStart) { pressStart = now; triggered = false; }
+    uint32_t held = now - pressStart;
+    g_btnArming = held > 1000;                         // LED shows the "about to reset" fast blink
+    if (!triggered && held >= OBI_RESET_HOLD_MS) { triggered = true; doFactoryReset(); }
+  } else {
+    pressStart = 0;
+    g_btnArming = false;
+  }
+}
+#endif // PIN_BUTTON
+
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 3000) {}
   delay(200);
+  flash_dbg_force_dio();   // OBI board: switch esp_flash to DIO before anything reads flash/NVS/OTA
+  led_setup(); led_set(LED_BOOT);   // status LED (boards with PIN_STATUS_LED, e.g. OBI gateway GPIO0)
   Serial.println("\n=== OBI LoRa mini-gateway ===");
   Serial.printf("gwid: %.6s   radio: %.1f MHz BW%.0f SF%d CR4/%d +%ddBm\n",
                 (const char *)GWID, OBI_FREQ_MHZ, OBI_BW_KHZ, OBI_SF, OBI_CR, OBI_TXPWR_DBM);
@@ -610,6 +671,10 @@ void setup() {
   radio.startReceive();
   Serial.println("listening + beaconing...");
 
+#ifdef PIN_BUTTON
+  buttonSetup();   // case button: hold to factory-reset (closed-case OBI_BOARD_OBI_C3)
+#endif
+  flash_dbg_uart_begin();   // UART flash console, runs alongside the log (type 'help')
   web_setup();     // WiFi config portal + web dashboard + MQTT (non-fatal if WiFi is unavailable)
 }
 
@@ -618,6 +683,26 @@ void loop() {
   uint32_t now = millis();
 
   if (g_rx) { g_rx = false; handleRx(); }
+
+#ifdef PIN_BUTTON
+  buttonLoop();   // case button: poll for a >=5 s hold -> factory reset
+#endif
+  flash_dbg_uart_poll();   // service the UART flash console (non-blocking)
+
+  // status LED: pick the steady pattern (reset-arming > OTA > WiFi > setup-portal), then service it
+  static uint32_t ledTick = 0;
+  if (now - ledTick >= 100) {
+    ledTick = now;
+    bool arming = false;
+#ifdef PIN_BUTTON
+    arming = g_btnArming;
+#endif
+    if      (arming)                led_set(LED_RESET_ARMED);
+    else if (gw_ota_active())       led_set(LED_OTA);
+    else if (web_wifi_connected())  led_set(LED_WIFI);
+    else                            led_set(LED_PORTAL);
+  }
+  led_loop();
 
   if (now - lastBeacon >= 1000) { lastBeacon = now; sendBeacon(); }
   if (now - lastScan   >= 3000) { lastScan   = now; sendScan(); }

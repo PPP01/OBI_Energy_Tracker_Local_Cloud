@@ -1,0 +1,143 @@
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Open OBI Energy Tracker · Flash Console</title>
+<style>
+:root{--bg:#0b1013;--panel:#121d22;--panel2:#16232a;--line:#22333b;--ink:#cdd9d6;--dim:#7f9298;--faint:#54676d;
+--tx:#f0a63c;--rx:#4fd6c2;--ok:#5fc98a;--warn:#e0b341;--crit:#e5604d;--acc:#39e08a;
+--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--ui:system-ui,Segoe UI,Roboto,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--ui);line-height:1.5}
+.wrap{max-width:1100px;margin:0 auto;padding:18px 18px 48px}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:13px 15px;margin-bottom:16px;
+background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:12px}
+h1{margin:0;font-size:15px;font-weight:650}.sub{font-size:11.5px;color:var(--dim);font-family:var(--mono);text-transform:uppercase;letter-spacing:.04em}
+.spacer{flex:1}.led{width:9px;height:9px;border-radius:50%;background:var(--faint)}.led.on{background:var(--ok);box-shadow:0 0 10px 1px rgba(95,201,138,.7)}
+.led.err{background:var(--crit)}.status{font-family:var(--mono);font-size:12px;color:var(--dim);min-width:90px}
+select,input,button,textarea{font-family:var(--mono);font-size:12.5px;color:var(--ink);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 9px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}button.p{background:var(--acc);border-color:var(--acc);color:#052012;font-weight:700}
+button.d{background:#3a1414;border-color:#5c2020;color:#ffbcbc}
+button:disabled{opacity:.45;cursor:default}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.panel h2{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.row label{font-size:11.5px;color:var(--dim)}.row input{width:120px}
+#term{font-family:var(--mono);font-size:12.5px;background:#080c0e;border:1px solid var(--line);border-radius:10px;padding:12px;height:44vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
+#term .t{color:var(--tx)}#term .r{color:var(--ink)}#term .n{color:var(--dim)}#term .e{color:var(--crit)}
+.cmdbar{display:flex;gap:8px;margin-top:10px}.cmdbar input{flex:1}
+.hint{font-size:11.5px;color:var(--faint);margin-top:8px}
+.warn{color:#ffb4b4}
+code{color:var(--acc)}
+</style></head><body><div class=wrap>
+<header>
+<div><h1>🐞 Open OBI Energy Tracker · Flash Console</h1><div class=sub>Web Serial · flash_dbg UART commands</div></div>
+<div class=spacer></div>
+<span class=led id=led></span><span class=status id=status>disconnected</span>
+<select id=baud><option>115200</option><option>921600</option><option>230400</option><option>74880</option></select>
+<button class=p id=connect>Connect</button>
+</header>
+
+<div class=panel>
+<h2>Quick commands</h2>
+<div class=row>
+<button data-cmd=help>help</button>
+<button data-cmd=info>info</button>
+<button data-cmd=size>size</button>
+<button data-cmd=efuse>efuse</button>
+<button class=d data-cmd=reboot data-confirm="Reboot the device?">reboot</button>
+<button class=d data-cmd=download data-confirm="Jump into ROM UART download mode? The console link drops and esptool must take over (only works if download mode is NOT fused off).">download</button>
+</div>
+</div>
+
+<div class=panel>
+<h2>Flash read / write</h2>
+<div class=row>
+<label>addr</label><input id=r_addr value=0x0><label>len</label><input id=r_len value=256>
+<button id=b_rd>rd — hexdump</button>
+<button id=b_md5>md5 — hash</button>
+</div>
+<div class=row>
+<label>addr</label><input id=w_addr value=0x0><label>hex bytes</label><input id=w_hex value="DE AD BE EF" style="width:220px">
+<button class=p id=b_wr>wr — write</button>
+</div>
+<div class=row>
+<label>addr</label><input id=e_addr value=0x0><label>len</label><input id=e_len value=4096>
+<button class=d id=b_er>er — erase</button>
+</div>
+<div class=hint>Numbers are <code>0x</code>-hex or decimal. <span class=warn>Writing/erasing the wrong offset can brick the device.</span></div>
+</div>
+
+<div class=panel>
+<h2>Console</h2>
+<div id=term><span class=n>Not connected. Click <b>Connect</b> and pick the gateway's serial port (115200 8N1). Requires Chrome or Edge (Web Serial). The device console runs alongside its log output.</span>
+</div>
+<div class=cmdbar>
+<input id=cmd placeholder="type a command and press Enter (e.g. rd 0x8000 256)" disabled>
+<button id=send disabled>Send</button>
+<button id=clear>Clear</button>
+<button id=savelog>Save log</button>
+</div>
+<div class=hint>Available: <code>rd</code> <code>wr</code> <code>er</code> <code>md5</code> <code>info</code> <code>size</code> <code>efuse</code> <code>download</code> <code>reboot</code> <code>help</code></div>
+</div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+let port=null,writer=null,reader=null,keep=false,lineBuf="";
+const enc=new TextEncoder(),dec=new TextDecoder();
+
+function add(cls,txt){const t=$("#term");const atBottom=t.scrollHeight-t.scrollTop-t.clientHeight<40;
+const el=document.createElement("div");el.className=cls;el.textContent=txt;t.appendChild(el);
+if(atBottom)t.scrollTop=t.scrollHeight;}
+function setConn(on,txt,err){$("#led").className="led"+(on?" on":err?" err":"");$("#status").textContent=txt;
+$("#connect").textContent=on?"Disconnect":"Connect";$("#cmd").disabled=!on;$("#send").disabled=!on;}
+
+async function connect(){
+  if(port){await disconnect();return;}
+  if(!navigator.serial){add("e","Web Serial not available — use Chrome or Edge over https/file://");return;}
+  try{
+    port=await navigator.serial.requestPort();
+    await port.open({baudRate:+$("#baud").value,dataBits:8,stopBits:1,parity:"none",flowControl:"none"});
+    writer=port.writable.getWriter();keep=true;readLoop();
+    setConn(true,"connected");add("n","— port opened @ "+$("#baud").value+" 8N1 —");
+    setTimeout(()=>send("help"),300);
+  }catch(e){setConn(false,"error",true);add("e","connect failed — "+e.message);port=null;}
+}
+async function disconnect(){
+  keep=false;
+  try{if(reader){await reader.cancel();reader.releaseLock();reader=null;}}catch(_){}
+  try{if(writer){writer.releaseLock();writer=null;}}catch(_){}
+  try{if(port){await port.close();}}catch(_){}
+  port=null;setConn(false,"disconnected");add("n","— port closed —");
+}
+async function readLoop(){
+  while(port&&port.readable&&keep){
+    try{reader=port.readable.getReader();
+      while(true){const{value,done}=await reader.read();if(done)break;if(value&&value.length)feed(value);}
+    }catch(e){if(keep)add("e","read error — "+e.message);}
+    finally{if(reader){try{reader.releaseLock();}catch(_){}}reader=null;}
+    if(!keep)break;
+  }
+}
+function feed(bytes){
+  lineBuf+=dec.decode(bytes,{stream:true});
+  let nl;while((nl=lineBuf.indexOf("\n"))>=0){let line=lineBuf.slice(0,nl).replace(/\r$/,"");lineBuf=lineBuf.slice(nl+1);add("r",line);}
+}
+async function send(str){
+  if(!writer){add("e","not connected");return;}
+  add("t","> "+str);
+  try{await writer.write(enc.encode(str+"\n"));}catch(e){add("e","write failed — "+e.message);}
+}
+
+$("#connect").addEventListener("click",connect);
+$("#clear").addEventListener("click",()=>$("#term").innerHTML="");
+$("#savelog").addEventListener("click",()=>{const b=new Blob([$("#term").innerText],{type:"text/plain"});
+const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="obi_console.log";a.click();});
+$("#cmd").addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.value.trim()){send(e.target.value.trim());e.target.value="";}});
+$("#send").addEventListener("click",()=>{const v=$("#cmd").value.trim();if(v){send(v);$("#cmd").value="";}});
+
+document.querySelectorAll("button[data-cmd]").forEach(b=>b.addEventListener("click",()=>{
+  if(b.dataset.confirm&&!confirm(b.dataset.confirm))return;send(b.dataset.cmd);}));
+$("#b_rd").addEventListener("click",()=>send(`rd ${$("#r_addr").value} ${$("#r_len").value}`));
+$("#b_md5").addEventListener("click",()=>send(`md5 ${$("#r_addr").value} ${$("#r_len").value}`));
+$("#b_wr").addEventListener("click",()=>{if(confirm("Write to flash @"+$("#w_addr").value+"?"))send(`wr ${$("#w_addr").value} ${$("#w_hex").value}`);});
+$("#b_er").addEventListener("click",()=>{if(confirm("Erase @"+$("#e_addr").value+"?"))send(`er ${$("#e_addr").value} ${$("#e_len").value}`);});
+</script></body></html>

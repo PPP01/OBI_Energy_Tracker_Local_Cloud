@@ -37,6 +37,7 @@ bind + ECDH). Everything was reverse-engineered from firmware `1.2.1`; details i
 | 7 | **MQTT + Home Assistant** | publishes each reader as JSON; **HA auto-discovery** (sensors, binary sensors, availability + a settable interval `number`) so devices appear automatically; **command topic** to set the interval remotely |
 | 8 | **Persistence** | reader UUIDs + MQTT settings saved in NVS, survive reboots |
 | 9 | **Board-generic** | any ESP32 / ESP32-S3 + SX1262 via `board_config.h`; not tied to one vendor board |
+| 10 | **On-board e-paper** | Heltec Vision Master E290 2.9″ display shows live gateway + reader status (auto-detected via the board flag; other boards unaffected) |
 
 ## Hardware & wiring
 
@@ -80,7 +81,8 @@ pio run -e generic_esp32      -t upload      # classic ESP32 + your own wiring
 pio device monitor -b 115200
 ```
 
-**First boot:** the device opens a WiFi setup portal named **`OBI-Gateway-Setup`** (`192.168.4.1`). Join it,
+**First boot:** the device opens a WiFi setup portal named **`OpenOBI-<MAC>`** (e.g. `OpenOBI-3AF4C2`, the
+last 3 bytes of the device MAC so two gateways never clash) at `192.168.4.1`. Join it,
 enter your WiFi (and optionally MQTT), save. The dashboard is then at the IP printed on the serial log
 (`http://<device-ip>/`). LoRa runs immediately — turn the vendor bridge **off** and the readers will
 re-pair to this gateway on their own within a minute.
@@ -100,6 +102,16 @@ re-pair to this gateway on their own within a minute.
 - **DE/EN toggle**, remembered in the browser.
 - The web/MQTT stack runs on **core 0** while LoRa runs on **core 1**, so HTTP traffic never stutters the
   radio timing.
+
+### On-board e-paper display (Heltec Vision Master E290)
+
+If you build the `vision_master_e290` env, the 2.9″ e-paper (DEPG0290BNS800 / SSD1680, 296×128) shows a live
+status page: **WiFi IP** (or the setup-AP hint), **MQTT** state, reader count, and a line per reader with its
+id, import/export (kWh), infrared status, RSSI and battery. It runs on **core 0** on its **own SPI bus**
+(pins in [`include/board_config.h`](include/board_config.h)), so it never touches the LoRa timing. To spare the
+slow, wear-prone panel it only redraws when the shown values change (flicker-free partial refresh, with an
+occasional full refresh to clear ghosting). Other boards are unaffected — the display code is gated behind the
+`OBI_HAS_EPD` board flag and the GxEPD2 library is only pulled for the Heltec env.
 
 ## Setting the upload interval
 
@@ -254,6 +266,7 @@ Bind + ECDH). Alles wurde aus Firmware `1.2.1` reversed; Details in
 | 7 | **MQTT + Home Assistant** | publiziert jeden Reader als JSON; **HA-Auto-Discovery** (Sensoren, Binärsensoren, Verfügbarkeit + einstellbares Intervall-`number`), sodass Geräte automatisch erscheinen; **Command-Topic** zum Fern-Setzen des Intervalls |
 | 8 | **Persistenz** | Reader-UUIDs + MQTT-Einstellungen im NVS gespeichert, überstehen Neustarts |
 | 9 | **Board-generisch** | beliebiger ESP32 / ESP32-S3 + SX1262 via `board_config.h`; nicht an ein Hersteller-Board gebunden |
+| 10 | **On-Board-E-Ink** | Heltec Vision Master E290 2,9″-Display zeigt Live-Status von Gateway + Readern (über das Board-Flag automatisch; andere Boards unberührt) |
 
 ## Hardware & Verdrahtung
 
@@ -297,8 +310,9 @@ pio run -e generic_esp32      -t upload      # klassischer ESP32 + eigene Verdra
 pio device monitor -b 115200
 ```
 
-**Erster Start:** das Gerät öffnet ein WLAN-Einrichtungsportal namens **`OBI-Gateway-Setup`**
-(`192.168.4.1`). Verbinde dich damit, gib dein WLAN (und optional MQTT) ein, speichern. Das Dashboard ist
+**Erster Start:** das Gerät öffnet ein WLAN-Einrichtungsportal namens **`OpenOBI-<MAC>`** (z. B.
+`OpenOBI-3AF4C2`, die letzten 3 Bytes der Geräte-MAC, damit sich zwei Gateways nie in die Quere kommen)
+unter `192.168.4.1`. Verbinde dich damit, gib dein WLAN (und optional MQTT) ein, speichern. Das Dashboard ist
 dann unter der im seriellen Log ausgegebenen IP erreichbar (`http://‹geräte-ip›/`). LoRa läuft sofort —
 schalte die Hersteller-Bridge **aus**, und die Reader koppeln sich innerhalb einer Minute von selbst an
 dieses Gateway.
@@ -320,6 +334,16 @@ dieses Gateway.
   Home-Assistant-Discovery-Configs neu.
 - **DE/EN-Umschalter**, im Browser gemerkt.
 - Der Web-/MQTT-Stack läuft auf **Core 0**, LoRa auf **Core 1**, damit HTTP-Verkehr das Funk-Timing nie stört.
+
+### On-Board-E-Ink-Display (Heltec Vision Master E290)
+
+Beim `vision_master_e290`-Build zeigt das 2,9″-E-Paper (DEPG0290BNS800 / SSD1680, 296×128) eine Live-Statusseite:
+**WLAN-IP** (bzw. den Setup-AP-Hinweis), **MQTT**-Zustand, Reader-Anzahl und je Reader eine Zeile mit ID,
+Bezug/Einspeisung (kWh), Infrarot-Status, RSSI und Batterie. Es läuft auf **Core 0** an einem **eigenen
+SPI-Bus** (Pins in [`include/board_config.h`](include/board_config.h)) und rührt das Funk-Timing nie an. Um das
+langsame, verschleißende Panel zu schonen, wird nur neu gezeichnet, wenn sich die Werte ändern (flackerfreier
+Partial-Refresh, gelegentlich ein Full-Refresh gegen Ghosting). Andere Boards sind unberührt — der Display-Code
+hängt am Board-Flag `OBI_HAS_EPD`, und GxEPD2 wird nur im Heltec-Env eingebunden.
 
 ## Upload-Intervall setzen
 
