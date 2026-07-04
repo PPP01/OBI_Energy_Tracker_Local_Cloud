@@ -275,7 +275,7 @@ footer b{font-family:var(--mono);color:var(--txt)}
   <div class="grid2">
    <div style="grid-column:1/3"><label id="l_wnet">Network (scan)</label>
     <div style="display:flex;gap:8px">
-     <select id="wf_ssid" style="flex:1"><option value="">— scan for networks —</option></select>
+     <select id="wf_ssid" onchange="wifiPick()" style="flex:1"><option value="">— scan for networks —</option></select>
      <button class="g" id="wf_scanb" onclick="scanWifi()">Scan</button>
     </div></div>
    <div><label id="l_wman">…or type SSID</label><input id="wf_manual" placeholder="MyNetwork"></div>
@@ -361,7 +361,8 @@ async function scanWifi(){$('#wf_msg').textContent=lang=='de'?'suche…':'scanni
   $('#wf_ssid').innerHTML=opts;$('#wf_msg').textContent=Object.keys(seen).length+(lang=='de'?' Netzwerke':' networks');}
  catch(e){$('#wf_msg').textContent=lang=='de'?'Scan fehlgeschlagen':'scan failed';}
  $('#wf_scanb').disabled=false;}
-function wifiSsid(){return $('#wf_ssid').value||$('#wf_manual').value.trim();}
+function wifiPick(){var v=$('#wf_ssid').value;if(v){$('#wf_manual').value=v;$('#wf_pass').focus();}}
+function wifiSsid(){return $('#wf_manual').value.trim()||$('#wf_ssid').value;}
 async function wifiConnect(){let s=wifiSsid();if(!s){$('#wf_msg').textContent=lang=='de'?'SSID wählen/eingeben':'pick or type an SSID';return;}
  $('#wf_msg').textContent=(lang=='de'?'verbinde mit ':'connecting to ')+s+'…';
  try{await fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
