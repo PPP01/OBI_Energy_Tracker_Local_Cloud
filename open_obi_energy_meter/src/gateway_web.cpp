@@ -10,6 +10,7 @@
 #include <Update.h>               // ESP32 self-OTA (reflash our own app into the other OTA slot)
 #include <esp_partition.h>        // partition list for the /debug hex editor
 #include <esp_mac.h>              // base MAC for the per-device setup-AP name
+#include <soc/soc_caps.h>         // SOC_TEMP_SENSOR_SUPPORTED (internal temperature sensor)
 #include <PubSubClient.h>         // knolleary/PubSubClient
 #include <Preferences.h>
 #include "board_config.h"         // OBI_HAS_EPD + e-paper pins (Heltec Vision Master E290)
@@ -43,6 +44,25 @@ static const char *apSsid() {
     snprintf(ssid, sizeof ssid, "OpenOBI-%02X%02X%02X", mac[3], mac[4], mac[5]);
   }
   return ssid;
+}
+
+// Gateway identity for MQTT (per-device, so several gateways can share a broker/base topic).
+static const char *gwId() {   // last 3 MAC bytes, lowercase hex (e.g. "b455e4")
+  static char id[8];
+  if (!id[0]) { uint8_t m[6]; esp_read_mac(m, ESP_MAC_WIFI_STA); snprintf(id, sizeof id, "%02x%02x%02x", m[3], m[4], m[5]); }
+  return id;
+}
+static const char *gwMac() {  // full MAC, uppercase hex, no separators
+  static char mac[13];
+  if (!mac[0]) { uint8_t m[6]; esp_read_mac(m, ESP_MAC_WIFI_STA); snprintf(mac, sizeof mac, "%02X%02X%02X%02X%02X%02X", m[0], m[1], m[2], m[3], m[4], m[5]); }
+  return mac;
+}
+static float gwTempC() {      // internal temperature sensor (°C); NAN on chips without one (classic ESP32)
+#if defined(SOC_TEMP_SENSOR_SUPPORTED) && SOC_TEMP_SENSOR_SUPPORTED
+  return temperatureRead();
+#else
+  return NAN;
+#endif
 }
 
 static char     g_mqttHost[64] = "";
@@ -100,6 +120,7 @@ static String readersJson() {
     j += ",\"uuid\":" + (r.haveUuid ? "\"" + uuidStr(r.uuid) + "\"" : "null");
     j += ",\"type\":\"" + String(typeName(r.devType)) + "\"";
     j += ",\"paired\":" + String(r.haveKey ? "true" : "false");
+    j += ",\"assigned\":" + String(r.assigned ? "true" : "false");
     j += ",\"legacy\":" + String(r.legacy ? "true" : "false");
     j += ",\"softver\":" + String(r.softver) + ",\"hardver\":" + String(r.hardver);
     j += ",\"battery_mV\":" + String(r.battery_mV);
@@ -121,6 +142,9 @@ static String statusJson() {
   String j = "{";
   j += "\"gwid\":\"" + hex(GWID, 6) + "\"";
   j += ",\"gwid_ascii\":" + jstr(String((const char *)GWID).substring(0, 6).c_str());
+  j += ",\"mac\":\"" + String(gwMac()) + "\",\"gw\":\"" + String(gwId()) + "\"";
+  { float t = gwTempC(); j += ",\"temp_c\":" + (isnan(t) ? String("null") : String(t, 1)); }
+  j += ",\"pair_remaining_s\":" + String(gw_pair_remaining_s());
   j += ",\"uptime_s\":" + String(gw_uptime_s());
   j += ",\"wifi\":" + String(g_wifiOk ? "true" : "false");
   j += ",\"ip\":\"" + (g_wifiOk ? WiFi.localIP().toString() : String("-")) + "\"";
@@ -181,6 +205,10 @@ h1{font-size:16px;margin:0;font-weight:650}.sub{color:var(--dim);font-size:12px}
  text-transform:uppercase;letter-spacing:.8px;font-weight:700}
 .tag.meter{color:var(--blue);border-color:#26496f;background:#1a2c4022}
 .tag.outlet{color:var(--amber);border-color:#5a4713;background:#3a2e0a22}
+.tag.pend{color:#ffd166;border-color:#6a5316;background:#4a3a0e33}
+.card.pending{opacity:.62;filter:grayscale(.5)}
+.card.pending .mx,.card.pending .uuid{opacity:.8}
+.pairbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
 .meta{color:var(--dim);font-size:12px;font-family:var(--mono)}
 .del{margin-left:auto;background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:7px;padding:3px 9px;cursor:pointer;font-size:13px;line-height:1}
 .del:hover{border-color:var(--red);color:var(--red)}
@@ -220,7 +248,9 @@ footer b{font-family:var(--mono);color:var(--txt)}
 <button class="icon" onclick="tog('wf')" title="Configure WiFi — scan networks and connect (no AP switch needed)">📶 WiFi</button>
 <button class="icon" onclick="tog('mq')" title="MQTT settings">⚙ MQTT</button>
 <button class="icon" onclick="location.href='/update'" title="Upload a new firmware .bin (OTA self-update)">⬆ Firmware</button>
-<button class="icon" onclick="location.href='/debug'" title="Flash hex editor / eFuses / debug">🐞 Debug</button></div>
+<button class="icon" onclick="location.href='/radio'" title="Live LoRa radio messages">📡 Radio</button>
+<button class="icon" onclick="location.href='/debug'" title="Flash hex editor / eFuses / debug">🐞 Debug</button>
+<button class="icon" onclick="rebootGw()" title="Restart the gateway">⟳ Reboot</button></div>
 <div class="bar" id="bar"></div>
 </header>
 <div class="wrap">
@@ -258,6 +288,7 @@ footer b{font-family:var(--mono);color:var(--txt)}
   </div>
   <div class="sub" id="wf_note" style="margin-top:8px"></div>
  </div>
+ <div class="pairbar"><button class="b" id="pair_btn" onclick="pairAll()"></button><span class="meta" id="pair_st"></span></div>
  <div class="list" id="list"></div>
  <footer><span id="ft"></span> · <b id="gw"></b></footer>
 </div>
@@ -267,7 +298,10 @@ const T={
  de:{sub:'869,5 MHz · SF7 · liest deine Zähler direkt',wifi:'WLAN',mqtt:'MQTT',radio:'Funk',readers:'Reader',
   offline:'offline',fw:'Firmware',batt:'Batterie',opt:'Sensor',active:'aktiv',nosig:'kein Signal',
   imp:'Bezug',exp:'Einspeisung',pow:'Leistung',seen:'Zuletzt',before:'vor',setiv:'Intervall setzen',sec:'Sek.',
-  del:'Reader löschen',delq:'Reader %i aus der Liste entfernen?\n\nEr ist nicht dauerhaft gesperrt — beim nächsten Empfang taucht er wieder auf.',
+  del:'Reader löschen',delq:'Reader %i löschen und Binding entfernen?\n\nEr taucht beim nächsten Empfang wieder auf — dann ausgegraut (nicht gebunden).',
+  pending:'nicht gebunden',addrd:'🔗 An Gateway binden',unassign:'Lösen',
+  pendhint:'Wird nur angezeigt — noch nicht an dieses Gateway gebunden.',
+  pairall:'🔗 Alle für 3 Min binden',pairon:'Auto-Binding aktiv — %s s',pairoff:'Neue Reader bleiben ausgegraut, bis du sie bindest.',
   none:'Noch keine Reader',waiting:'Warte auf einen Reader — Reader-Taste ~10 s halten (echtes Gateway aus).',
   uuidwait:'UUID noch unbekannt — Reader per Taste neu verbinden',
   irhint:'Noch keine Messwerte — Reader-Taste einmal kurz drücken, um die Infrarot-Lesung zu starten.',
@@ -285,7 +319,10 @@ const T={
  en:{sub:'869.5 MHz · SF7 · reading your meters directly',wifi:'WiFi',mqtt:'MQTT',radio:'Radio',readers:'Readers',
   offline:'offline',fw:'Firmware',batt:'Battery',opt:'Sensor',active:'active',nosig:'no signal',
   imp:'Import',exp:'Export',pow:'Power',seen:'Last seen',before:'',setiv:'Set interval',sec:'sec',
-  del:'Delete reader',delq:'Remove reader %i from the list?\n\nIt is not permanently blocked — it reappears on the next reception.',
+  del:'Delete reader',delq:'Delete reader %i and remove its binding?\n\nIt reappears greyed (unbound) on the next reception.',
+  pending:'not bound',addrd:'🔗 Bind to gateway',unassign:'Unbind',
+  pendhint:'Shown only — not yet bound to this gateway.',
+  pairall:'🔗 Bind all for 3 min',pairon:'Auto-binding active — %s s',pairoff:'New readers stay greyed until you bind them.',
   none:'No readers yet',waiting:'Waiting for a reader — hold its button ~10 s (real gateway off).',
   uuidwait:'UUID unknown yet — reconnect the reader with its button',
   irhint:'No readings yet — tap the reader button once to start its infrared readout.',
@@ -310,8 +347,12 @@ function applyLang(){$('#lde').className=lang=='de'?'act':'';$('#len').className
  $('#l_wnet').textContent=de?'Netzwerk (Scan)':'Network (scan)';$('#wf_scanb').textContent=de?'Scannen':'Scan';
  $('#l_wman').textContent=de?'…oder SSID eingeben':'…or type SSID';$('#l_wpass').textContent=L.pass;
  $('#wf_conn').textContent=de?'Verbinden':'Connect';$('#wf_portal').textContent=de?'Setup-Portal (AP)':'Setup portal (AP)';
- $('#wf_note').textContent=de?'Der Scan pausiert das Dashboard kurz. Ändert sich die IP nach dem Verbinden, öffne das Dashboard unter der neuen IP (siehe Serial-Log / E-Paper).':'Scanning briefly pauses the dashboard. If the IP changes after connecting, reopen the dashboard at the new IP (serial log / e-paper).';}
+ $('#wf_note').textContent=de?'Der Scan pausiert das Dashboard kurz. Ändert sich die IP nach dem Verbinden, öffne das Dashboard unter der neuen IP (siehe Serial-Log / E-Paper).':'Scanning briefly pauses the dashboard. If the IP changes after connecting, reopen the dashboard at the new IP (serial log / e-paper).';
+ $('#pair_btn').textContent=L.pairall;}
 function tog(id){$('#'+id).classList.toggle('open')}
+function rebootGw(){if(!confirm(lang=='de'?'Gateway jetzt neu starten?':'Restart the gateway now?'))return;
+ fetch('/api/reboot',{method:'POST'}).catch(()=>{});
+ alert(lang=='de'?'Neustart läuft… in ~10 s wieder erreichbar.':'Restarting… back in ~10 s.');}
 async function scanWifi(){$('#wf_msg').textContent=lang=='de'?'suche…':'scanning…';$('#wf_scanb').disabled=true;
  try{let n=await(await fetch('/api/wifi/scan')).json();n.sort((a,b)=>b.rssi-a.rssi);
   let seen={},opts='<option value="">'+(lang=='de'?'— Netzwerk wählen —':'— pick a network —')+'</option>';
@@ -337,7 +378,7 @@ function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.fl
 let cfgLoaded=false;
 async function tick(){try{
  const st=await (await fetch('/api/status')).json(), rs=await (await fetch('/api/readers')).json();
- $('#gw').textContent=st.gwid_ascii+' · '+st.gwid;$('#ft').textContent=L.uptime+' '+fmt(st.uptime_s);
+ $('#gw').textContent=st.gwid_ascii+' · '+(st.mac||st.gwid);$('#ft').textContent=L.uptime+' '+fmt(st.uptime_s);
  const q=st.mqtt;
  const mqp=!q.enabled?`<span class="dot idle"></span>${L.disabled}`
   :q.connected?`<span class="dot on"></span>${q.host} · ${q.pub_count} ${L.msgs} · ${q.last_pub_s<0?L.never:L.lastpub+' '+q.last_pub_s+'s '+L.ago}`
@@ -347,9 +388,11 @@ async function tick(){try{
   [L.mqtt,mqp],
   [L.radio,`<span class="dot on"></span>${st.freq_mhz} MHz · SF${st.sf} · BW${st.bw_khz}`],
   [L.readers,`<b>${rs.length}</b>`]
- ].map(p=>`<div class="pill"><span class="k">${p[0]}</span>${p[1]}</div>`).join('');
+ ].concat(st.temp_c!=null?[['Temp',`<b>${st.temp_c} °C</b>`]]:[])
+  .map(p=>`<div class="pill"><span class="k">${p[0]}</span>${p[1]}</div>`).join('');
+ $('#pair_st').textContent=st.pair_remaining_s>0?L.pairon.replace('%s',st.pair_remaining_s):L.pairoff;
  $('#mqtt_stat').innerHTML=q.enabled?(q.connected?`<span class="dot on"></span>${L.con}`:`<span class="dot off"></span>${L.dis} — ${q.state}`):`<span class="dot idle"></span>${L.disabled}`;
- $('#mqtt_cmd').innerHTML=`${L.cmdhint}<br><code>${q.topic}/&lt;id&gt;/set_interval</code> ← <code>30</code>`;
+ $('#mqtt_cmd').innerHTML=`${L.cmdhint}<br><code>${q.topic}/&lt;id&gt;/set_interval</code> ← <code>30</code><br><code>${q.topic}/gateway/${st.gw}/reboot</code> ← <code>reboot</code>`;
  if(!cfgLoaded){cfgLoaded=true;$('#c_host').value=q.host;$('#c_port').value=q.port;$('#c_user').value=q.user;$('#c_topic').value=q.topic;}
  // don't blow away a reader card while its interval/file input is focused (you'd never finish typing)
  const ae=document.activeElement, editing=ae&&/^(iv_|fw_)/.test(ae.id||'');
@@ -359,9 +402,10 @@ async function tick(){try{
 function card(r){
  const p=Math.max(0,Math.min(100,Math.round((r.battery_mV-2400)/8)));
  const sens=r.infrared?`<span class="dot on"></span>${L.active}`:`<span class="dot idle"></span>${L.nosig}`;
- return `<div class="card">
+ return `<div class="card${r.assigned?'':' pending'}">
   <div class="hd"><span class="id">${r.id.toUpperCase()}</span>
    <span class="tag ${r.type}">${r.type}</span>
+   ${r.assigned?'':`<span class="tag pend">${L.pending}</span>`}
    <span class="meta">FW ${r.softver} · HW ${r.hardver}${r.legacy?' · legacy':''} · ${r.rssi} dBm${r.paired?' · 🔒':''}</span>
    <button class="del" onclick="delReader('${r.id}')" title="${L.del}">✕</button></div>
   <div class="uuid">${r.uuid?('<b>UUID</b> '+r.uuid):L.uuidwait}</div>
@@ -375,15 +419,19 @@ function card(r){
    <div class="mc"><div class="l">${L.opt}</div><span class="v" style="font-size:13px">${sens}</span></div>
    <div class="mc"><div class="l">${L.seen}</div><span class="v">${L.before} ${r.age_s}s</span></div>
   </div>
-  <div class="ctrl"><input type="number" id="iv_${r.id}" placeholder="${L.sec}" min="5" value="${r.interval||''}">
+  ${r.assigned?`<div class="ctrl"><input type="number" id="iv_${r.id}" placeholder="${L.sec}" min="5" value="${r.interval||''}">
    <button class="g" onclick="setIv('${r.id}')">${L.setiv}</button>
    <input type="file" id="fw_${r.id}" accept=".bin" style="flex:1 1 200px;min-width:170px;padding:6px 8px;font-size:12px">
    <button class="g" onclick="doOta('${r.id}',${r.softver||0})">${L.flash}</button>
-   <span class="meta" id="op_${r.id}"></span></div>
-  ${!r.has_data&&!r.bootloader?`<div class="hint">⚠ ${L.irhint}</div>`:''}
+   <span class="meta" id="op_${r.id}"></span></div>`
+  :`<div class="ctrl"><button class="b" onclick="assignRd('${r.id}',1)">${L.addrd}</button>
+   <span class="meta">${L.pendhint}</span></div>`}
+  ${r.assigned&&!r.has_data&&!r.bootloader?`<div class="hint">⚠ ${L.irhint}</div>`:''}
  </div>`;
 }
 async function setIv(id){const v=$('#iv_'+id).value;if(!v)return;await fetch('/api/interval?id='+id+'&seconds='+v,{method:'POST'});tick();}
+async function assignRd(id,on){await fetch('/api/assign?id='+id+'&on='+on,{method:'POST'});tick();}
+async function pairAll(){await fetch('/api/pairall',{method:'POST'});tick();}
 async function delReader(id){if(!confirm(L.delq.replace('%i',id.toUpperCase())))return;
  await fetch('/api/delete?id='+id,{method:'POST'});tick();}
 let uploading=false;
@@ -587,6 +635,72 @@ static void handleFlashErase() {
   server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 static void handleEfuse() { server.send(200, "application/json", flash_dbg_efuse_json()); }
+static void handleReboot() {   // answer first, then restart
+  server.send(200, "application/json", "{\"ok\":true}");
+  Serial.println("[web] reboot requested from dashboard");
+  delay(200);
+  ESP.restart();
+}
+// Accept a reader onto this gateway (or drop it again). ?id=<6hex>&on=0|1 (on defaults to 1).
+static void handleAssign() {
+  String id = server.arg("id");
+  if (id.length() != 6) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  bool on = server.arg("on") != "0";
+  uint8_t h[3];
+  for (int i = 0; i < 3; i++) h[i] = (uint8_t)strtol(id.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+  gw_assign_reader(h, on);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+// Open a 3-minute (default) window that auto-accepts every reader that announces.
+static void handlePairAll() {
+  uint16_t s = server.arg("seconds").length() ? (uint16_t)server.arg("seconds").toInt() : 180;
+  if (s == 0 || s > 3600) s = 180;
+  gw_pair_all(s);
+  server.send(200, "application/json", String("{\"ok\":true,\"seconds\":") + s + "}");
+}
+static void handleRadioApi() {
+  uint32_t since = strtoul(server.arg("since").c_str(), nullptr, 10);
+  server.send(200, "application/json", gw_radio_json(since));
+}
+static void handleRadioPage() {
+  server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Radio</title><style>
+:root{--bg:#0a0e14;--panel:#141a23;--line:#232e3c;--txt:#eaf0f7;--dim:#7d8da0;--rx:#4fd6c2;--tx:#f0a63c;--mono:ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0}
+header b{font-size:15px}header a{color:var(--rx);text-decoration:none;font-size:13px}.sp{flex:1}
+button{background:#1b2430;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 11px;cursor:pointer;font-family:var(--mono);font-size:13px}
+button.on{background:var(--rx);border-color:var(--rx);color:#052018;font-weight:700}
+.wrap{padding:12px 16px}table{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:12.5px}
+th{color:var(--dim);text-align:left;font-weight:600;padding:4px 8px;border-bottom:1px solid var(--line);position:sticky;top:47px;background:var(--bg)}
+td{padding:2px 8px;border-bottom:1px solid #172030;white-space:nowrap}
+tr.T td{color:var(--tx)}tr.R td{color:var(--txt)}.hl{color:var(--rx)}.dim{color:var(--dim)}
+.d{font-weight:700}.filt{width:110px;background:#1b2430;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:6px 8px;font-family:var(--mono);font-size:12px}
+</style></head><body>
+<header><b>📡 Radio live</b><span class=dim id=stat></span><span class=sp></span>
+<input class=filt id=filt placeholder="filter id/cmd"><button id=pause onclick=togglePause()>⏸ Pause</button>
+<button onclick="rows=[];render()">Clear</button><a href="/">← dashboard</a></header>
+<div class=wrap><table><thead><tr><th>t (ms)</th><th>dir</th><th>id</th><th>cmd</th><th>len</th><th>rssi</th><th>note</th></tr></thead>
+<tbody id=tb></tbody></table></div>
+<script>
+const CN={15:'beacon',17:'announce',18:'reconnect',19:'energy',22:'energy',23:'energy',24:'energy',25:'energy',
+32:'ECDH',20:'ota-pull',21:'ota-pull',33:'ota-pull',35:'announce',36:'scan',37:'energy',38:'ack',39:'energy-live',
+40:'ack-live',49:'bind-ack',50:'recon-ack',56:'ack',57:'ack',58:'reconnect',59:'bind'};
+let rows=[],since=0,paused=false;const $=i=>document.getElementById(i);
+function cname(e){return e.d==='T'?(e.n||'tx'):(CN[e.c]||('cmd'+e.c));}
+function render(){let f=$('filt').value.trim().toLowerCase();
+ let html=rows.slice(-400).filter(e=>!f||(e.h.toLowerCase().includes(f)||cname(e).toLowerCase().includes(f)||(''+e.c)===f)).reverse()
+  .map(e=>`<tr class=${e.d}><td class=dim>${e.t}</td><td class=d>${e.d==='T'?'» TX':'« RX'}</td><td class=hl>${e.h}</td><td class=d>${cname(e)}${e.d==='R'?' <span class=dim>('+e.c+')</span>':''}</td><td>${e.l}</td><td>${e.d==='R'?e.r:''}</td><td class=dim>${e.n||''}</td></tr>`).join('');
+ $('tb').innerHTML=html;}
+async function poll(){if(paused)return;
+ try{let r=await(await fetch('/api/radio?since='+since)).json();
+  if(r.e&&r.e.length){rows=rows.concat(r.e);if(rows.length>800)rows=rows.slice(-800);render();}
+  since=r.seq;$('stat').textContent='seq '+r.seq+' · '+rows.length+' shown';}catch(e){}}
+function togglePause(){paused=!paused;$('pause').textContent=paused?'▶ Resume':'⏸ Pause';$('pause').classList.toggle('on',paused);}
+$('filt').oninput=render;
+setInterval(poll,600);poll();
+</script></body></html>)HTML");
+}
 static void handleDebugPage() {
   server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Flash Debug</title><style>
@@ -749,6 +863,11 @@ static void startServices() {
   server.on("/api/flash/patch", HTTP_POST, handleFlashPatch);
   server.on("/api/flash/erase", HTTP_POST, handleFlashErase);
   server.on("/api/efuse",       HTTP_GET,  handleEfuse);
+  server.on("/api/reboot",      HTTP_POST, handleReboot);   // restart the gateway from the dashboard
+  server.on("/api/assign",      HTTP_POST, handleAssign);   // accept/drop a reader onto this gateway
+  server.on("/api/pairall",     HTTP_POST, handlePairAll);  // open the 3-min auto-accept window
+  server.on("/radio",           HTTP_GET,  handleRadioPage);  // live radio message view
+  server.on("/api/radio",       HTTP_GET,  handleRadioApi);
   }   // end one-time route registration
   server.begin();
   mqtt.setServer(g_mqttHost, g_mqttPort);
@@ -820,8 +939,17 @@ static void runPortal() {
 
 // ---- MQTT command RX: publish "<seconds>" to <base>/<id>/set_interval ------
 // e.g.  mosquitto_pub -t obi/gateway/238d4e/set_interval -m 30
+// Per-gateway MQTT topics (namespaced by MAC so several gateways can share one base topic/broker):
+//   <base>/gateway/<gwid>          -> gateway state JSON (temp, uptime, heap, rssi)
+//   <base>/gateway/<gwid>/status   -> availability (LWT online/offline)
+//   <base>/gateway/<gwid>/reboot   -> command topic (payload ignored) -> restart
+static String gwStateTopic() { return String(g_mqttTopic) + "/gateway/" + gwId(); }
+static String avtTopic()     { return gwStateTopic() + "/status"; }
+static String rebootTopic()  { return gwStateTopic() + "/reboot"; }
+
 static void mqttCallback(char *topic, byte *payload, unsigned int len) {
   String t(topic);
+  if (t == rebootTopic()) { Serial.println("[mqtt] rx reboot command"); delay(150); ESP.restart(); }
   String base = String(g_mqttTopic) + "/";
   if (!t.startsWith(base)) return;
   String rest = t.substring(base.length());              // "<id>/set_interval"
@@ -851,7 +979,7 @@ static void publishDiscovery(const Reader &r) {
   String uid = "obi_" + id;                            // device id / unique_id base
   String stt = String(g_mqttTopic) + "/" + id;         // state topic (the JSON)
   String cmd = stt + "/set_interval";                  // command topic (number -> interval)
-  String avt = String(g_mqttTopic) + "/status";        // gateway LWT: online/offline
+  String avt = avtTopic();                             // per-gateway LWT: online/offline
   String dev = "\"dev\":{\"ids\":[\"" + uid + "\"],\"name\":\"OBI " + typeName(r.devType) + " " + id +
                "\",\"mf\":\"OBI\",\"mdl\":\"" + typeName(r.devType) +
                "\",\"sw\":\"" + String(r.softver) + "\",\"hw\":\"" + String(r.hardver) + "\"}";
@@ -919,6 +1047,53 @@ static void publishDiscovery(const Reader &r) {
   mqtt.publish(ntopic.c_str(), np.c_str(), true);
 }
 
+// HA discovery for the GATEWAY itself (temperature sensor + a restart button), keyed by MAC/gwid so
+// multiple gateways appear as separate devices.
+static void publishGatewayDiscovery() {
+  String uid = "obi_gw_" + String(gwId());
+  String stt = gwStateTopic();
+  String avt = avtTopic();
+  String dev = "\"dev\":{\"ids\":[\"" + uid + "\"],\"name\":\"OBI Gateway " + gwId() +
+               "\",\"mf\":\"Open OBI\",\"mdl\":\"LoRa Gateway\",\"sw\":\"" + String(gwMac()) + "\"}";
+  String availa = ",\"avty_t\":\"" + avt + "\"";
+  // temperature
+  { String t = "homeassistant/sensor/" + uid + "/temp/config";
+    String p = "{\"name\":\"Temperature\",\"uniq_id\":\"" + uid + "_temp\",\"stat_t\":\"" + stt +
+               "\",\"val_tpl\":\"{% if value_json.temp_c is not none %}{{ value_json.temp_c }}{% endif %}\""
+               ",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"" + availa + "," + dev + "}";
+    mqtt.publish(t.c_str(), p.c_str(), true); }
+  // WiFi signal
+  { String t = "homeassistant/sensor/" + uid + "/wifi/config";
+    String p = "{\"name\":\"WiFi signal\",\"uniq_id\":\"" + uid + "_wifi\",\"stat_t\":\"" + stt +
+               "\",\"val_tpl\":\"{{ value_json.wifi_rssi }}\",\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"" + availa + "," + dev + "}";
+    mqtt.publish(t.c_str(), p.c_str(), true); }
+  // IP address
+  { String t = "homeassistant/sensor/" + uid + "/ip/config";
+    String p = "{\"name\":\"IP address\",\"uniq_id\":\"" + uid + "_ip\",\"stat_t\":\"" + stt +
+               "\",\"val_tpl\":\"{{ value_json.ip }}\",\"icon\":\"mdi:ip-network\",\"ent_cat\":\"diagnostic\"" + availa + "," + dev + "}";
+    mqtt.publish(t.c_str(), p.c_str(), true); }
+  // free memory
+  { String t = "homeassistant/sensor/" + uid + "/heap/config";
+    String p = "{\"name\":\"Free memory\",\"uniq_id\":\"" + uid + "_heap\",\"stat_t\":\"" + stt +
+               "\",\"val_tpl\":\"{{ value_json.heap_free }}\",\"unit_of_meas\":\"B\",\"dev_cla\":\"data_size\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"" + availa + "," + dev + "}";
+    mqtt.publish(t.c_str(), p.c_str(), true); }
+  // reader count
+  { String t = "homeassistant/sensor/" + uid + "/readers/config";
+    String p = "{\"name\":\"Readers\",\"uniq_id\":\"" + uid + "_readers\",\"stat_t\":\"" + stt +
+               "\",\"val_tpl\":\"{{ value_json.readers }}\",\"stat_cla\":\"measurement\",\"icon\":\"mdi:counter\"" + availa + "," + dev + "}";
+    mqtt.publish(t.c_str(), p.c_str(), true); }
+  // uptime
+  { String t = "homeassistant/sensor/" + uid + "/uptime/config";
+    String p = "{\"name\":\"Uptime\",\"uniq_id\":\"" + uid + "_uptime\",\"stat_t\":\"" + stt +
+               "\",\"val_tpl\":\"{{ value_json.uptime_s }}\",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\",\"stat_cla\":\"total_increasing\",\"ent_cat\":\"diagnostic\"" + availa + "," + dev + "}";
+    mqtt.publish(t.c_str(), p.c_str(), true); }
+  // restart button
+  { String t = "homeassistant/button/" + uid + "/restart/config";
+    String p = "{\"name\":\"Restart\",\"uniq_id\":\"" + uid + "_restart\",\"cmd_t\":\"" + rebootTopic() +
+               "\",\"pl_prs\":\"reboot\",\"dev_cla\":\"restart\",\"ent_cat\":\"config\"" + availa + "," + dev + "}";
+    mqtt.publish(t.c_str(), p.c_str(), true); }
+}
+
 // Remove a reader's discovery entities from HA by publishing empty retained configs.
 // Mirrors the topics created by publishDiscovery() — keep the two lists in sync.
 static void clearDiscovery(const String &uid) {
@@ -944,8 +1119,8 @@ static void handleDelete() {
 // Web button: force a fresh discovery + availability publish for every known reader.
 static void handleRediscover() {
   if (!mqtt.connected()) { server.send(200, "application/json", "{\"ok\":false}"); return; }
-  String avt = String(g_mqttTopic) + "/status";
-  mqtt.publish(avt.c_str(), "online", true);
+  mqtt.publish(avtTopic().c_str(), "online", true);
+  publishGatewayDiscovery();
   int n = 0;
   for (int i = 0; i < MAX_READERS; i++) {
     Reader &r = readers[i];
@@ -960,15 +1135,17 @@ static void mqttService() {
   g_mqttState = mqtt.state();
   if (g_mqttHost[0] && !mqtt.connected() && now - lastTry > 8000) {
     lastTry = now;
-    String cid = "obi-gw-" + hex(GWID, 3);
-    String avt = String(g_mqttTopic) + "/status";               // availability (LWT) topic
+    String cid = "obi-gw-" + String(gwId());                    // unique client id per gateway
+    String avt = avtTopic();                                    // per-gateway availability (LWT) topic
     if (mqtt.connect(cid.c_str(), g_mqttUser[0] ? g_mqttUser : nullptr, g_mqttPass[0] ? g_mqttPass : nullptr,
                      avt.c_str(), 0, true, "offline")) {          // broker publishes "offline" if we drop
       String sub = String(g_mqttTopic) + "/+/set_interval";     // one wildcard level = reader id
       mqtt.subscribe(sub.c_str());
+      mqtt.subscribe(rebootTopic().c_str());                    // <base>/gateway/<gwid>/reboot
       mqtt.publish(avt.c_str(), "online", true);
+      publishGatewayDiscovery();
       for (int i = 0; i < MAX_READERS; i++) readers[i].mqttDiscovered = false;  // re-announce after (re)connect
-      Serial.printf("[mqtt] connected, subscribed %s\n", sub.c_str());
+      Serial.printf("[mqtt] connected as %s, subscribed %s + reboot\n", cid.c_str(), sub.c_str());
     }
     g_mqttState = mqtt.state();
   }
@@ -976,6 +1153,17 @@ static void mqttService() {
     mqtt.loop();
     if (now - lastPub > (uint32_t)g_pubEvery * 1000) {
       lastPub = now;
+      // gateway state (retained) — temp, uptime, heap, wifi rssi, reader count; keyed by MAC via the topic
+      { int rc = 0; for (int i = 0; i < MAX_READERS; i++) if (readers[i].used) rc++;
+        float t = gwTempC();
+        String gp = "{\"mac\":\"" + String(gwMac()) + "\",\"gw\":\"" + String(gwId()) + "\""
+                    ",\"temp_c\":" + (isnan(t) ? String("null") : String(t, 1)) +
+                    ",\"uptime_s\":" + String(gw_uptime_s()) +
+                    ",\"heap_free\":" + String(ESP.getFreeHeap()) +
+                    ",\"wifi_rssi\":" + String(WiFi.RSSI()) +
+                    ",\"ip\":\"" + WiFi.localIP().toString() + "\"" +
+                    ",\"readers\":" + String(rc) + "}";
+        if (mqtt.publish(gwStateTopic().c_str(), gp.c_str(), true)) g_mqttPubCount++; }
       for (int i = 0; i < MAX_READERS; i++) {
         Reader &r = readers[i];
         if (!r.used || !r.haveData) continue;

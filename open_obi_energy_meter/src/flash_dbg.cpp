@@ -12,6 +12,24 @@
 
 #define FDBG_SECTOR 4096u
 
+#ifdef OBI_FLASH_FORCE_DIO
+// The OBI board's flash is wired 2-line (DIO), but the Arduino C3 libs are built QIO. If the first NVS
+// read happens in QIO mode (Arduino's nvs_flash_init, during initArduino) it sees garbage, decides the
+// partition is corrupt and REFORMATS it — so settings/bindings written in DIO never survive a reboot.
+// Fix at the earliest possible point: a global constructor runs before app_main()/initArduino(), so the
+// esp_flash driver is already DIO before anything reads NVS. esp_flash_default_chip is set up in
+// esp_startup (before C++ ctors) and the FreeRTOS scheduler is up, so this is safe here.
+struct ObiDioForcer {
+  ObiDioForcer() {
+    if (esp_flash_default_chip) {
+      esp_flash_default_chip->read_mode = SPI_FLASH_DIO;
+      esp_flash_init(esp_flash_default_chip);
+    }
+  }
+};
+static ObiDioForcer g_obiDioForcer;
+#endif
+
 void flash_dbg_force_dio() {
 #ifdef OBI_FLASH_FORCE_DIO
   if (!esp_flash_default_chip) return;

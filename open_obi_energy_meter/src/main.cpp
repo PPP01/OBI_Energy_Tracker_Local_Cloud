@@ -69,23 +69,96 @@ static bool loadUuid(const uint8_t h[3], uint8_t uuid[16]) {
   return n == 16;
 }
 
+// Which readers the user has accepted onto THIS gateway (persisted). Until a reader is assigned it is
+// only tracked/shown (greyed) and NOT bound or key-exchanged, so two gateways don't fight over it.
+// NOTE: use a LOCAL Preferences per call — saveAssigned runs on the web task (core 0) while loadAssigned
+// runs on the LoRa task (core 1); a shared Preferences object's begin() returns false when already open on
+// the other core, so the write would silently hit a read-only/closed handle and never persist.
+static void saveAssigned(const uint8_t h[3], bool on) {
+  char k[8]; uuidKey(h, k);
+  Preferences p; p.begin("obiassign", false);
+  if (on) p.putBool(k, true); else p.remove(k);
+  p.end();
+  Serial.printf("[assign] %s %s\n", on ? "bind" : "unbind", k);
+}
+static bool loadAssigned(const uint8_t h[3]) {
+  char k[8]; uuidKey(h, k);
+  Preferences p; p.begin("obiassign", true);
+  bool v = p.getBool(k, false); p.end();
+  return v;
+}
+
+// Auto-pair window: while active, every reader that announces is accepted automatically.
+static uint32_t g_pairUntil = 0;
+static bool pairWindowActive() { return g_pairUntil && (int32_t)(millis() - g_pairUntil) < 0; }
+
 static Reader *addReader(const uint8_t h[3]) {
   Reader *r = findReader(h);
   if (r) return r;
   for (auto &x : readers) if (!x.used) {
     x = Reader{}; x.used = true; memcpy(x.handle, h, 3);
     if (loadUuid(h, x.uuid)) x.haveUuid = true;     // restore a previously-seen UUID
+    x.assigned = loadAssigned(h);                   // restore the accept flag (auto-binds on sight)
     return &x;
   }
   return nullptr;
 }
 
-// ---- radio RX flag ---------------------------------------------------------
+// Should we bind/key/ack this reader? Only if it's assigned — or auto-accept it during a pair window.
+static bool acceptReader(Reader *r) {
+  if (!r) return false;
+  if (r->assigned) return true;
+  if (pairWindowActive()) {
+    r->assigned = true; saveAssigned(r->handle, true);
+    Serial.printf("  [pair] auto-assigned %02X%02X%02X (pair-all window)\n", r->handle[0], r->handle[1], r->handle[2]);
+    return true;
+  }
+  return false;
+}
+
+// ---- radio RX flag + LoRa-task wakeup --------------------------------------
+// The LoRa RX/TX runs in its OWN high-priority FreeRTOS task (not loop()), so on the single-core C3 it
+// preempts the web/MQTT task and answers a reader's OTA block request inside its short RX window — the
+// same reason the stock firmware is fast on the C3. The DIO1 ISR wakes the task immediately.
 volatile bool g_rx = false;
-void IRAM_ATTR onDio1() { g_rx = true; }
+static SemaphoreHandle_t g_loraSem = nullptr;
+void IRAM_ATTR onDio1() {
+  g_rx = true;
+  if (g_loraSem) { BaseType_t hpw = pdFALSE; xSemaphoreGiveFromISR(g_loraSem, &hpw); if (hpw) portYIELD_FROM_ISR(); }
+}
 
 static void hexdump(const uint8_t *p, size_t n) {
   for (size_t i = 0; i < n; i++) { if (p[i] < 16) Serial.print('0'); Serial.print(p[i], HEX); Serial.print(' '); }
+}
+
+// ---- live radio log ring buffer (served by the /radio web page) ------------
+struct Rlog { uint32_t seq, ms; char dir; uint8_t h[3]; int16_t cmd, len, rssi; char note[20]; };
+static const int RLOG_N = 120;
+static Rlog g_rl[RLOG_N];
+static volatile uint32_t g_rlSeq = 0;
+static int g_rlHead = 0;
+void gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, const char *note) {
+  Rlog &e = g_rl[g_rlHead];
+  e.seq = ++g_rlSeq; e.ms = millis(); e.dir = dir;
+  if (h) memcpy(e.h, h, 3); else { e.h[0] = e.h[1] = e.h[2] = 0; }
+  e.cmd = (int16_t)cmd; e.len = (int16_t)len; e.rssi = (int16_t)rssi;
+  strncpy(e.note, note ? note : "", sizeof e.note - 1); e.note[sizeof e.note - 1] = 0;
+  g_rlHead = (g_rlHead + 1) % RLOG_N;
+}
+String gw_radio_json(uint32_t since) {
+  String j = "{\"seq\":" + String(g_rlSeq) + ",\"e\":[";
+  bool first = true;
+  for (int i = 0; i < RLOG_N; i++) {
+    Rlog &e = g_rl[i];
+    if (e.seq == 0 || e.seq <= since) continue;
+    char hs[7]; snprintf(hs, sizeof hs, "%02X%02X%02X", e.h[0], e.h[1], e.h[2]);
+    if (!first) j += ",";
+    first = false;
+    j += "{\"s\":" + String(e.seq) + ",\"t\":" + String(e.ms) + ",\"d\":\"" + String(e.dir) +
+         "\",\"h\":\"" + String(hs) + "\",\"c\":" + String(e.cmd) + ",\"l\":" + String(e.len) +
+         ",\"r\":" + String(e.rssi) + ",\"n\":\"" + String(e.note) + "\"}";
+  }
+  return j + "]}";
 }
 
 // transmit a frame, then go back to RX
@@ -93,7 +166,9 @@ static void txFrame(const uint8_t *buf, size_t len, const char *what) {
   int st = radio.transmit((uint8_t *)buf, len);
   radio.startReceive();
   g_rx = false;                 // discard the TxDone that also pulses DIO1
-  Serial.printf("  TX %-6s len=%d -> %d\n", what, (int)len, st);
+  gw_radio_log('T', buf, -1, (int)len, 0, what);   // buf[0..2] = target handle (plaintext)
+  if (strcmp(what, "ota-blk") != 0)                // skip the per-block spam during a reader OTA (frees the loop)
+    Serial.printf("  TX %-6s len=%d -> %d\n", what, (int)len, st);
 }
 
 // pull the 16-byte UUID + type + version out of an announce (XOR-decoded payload).
@@ -118,14 +193,34 @@ void gw_request_interval(const uint8_t handle[3], uint16_t seconds) {
   for (auto &r : readers)
     if (r.used && !memcmp(r.handle, handle, 3)) { r.setInterval = seconds; return; }
 }
-// Drop a reader from the list (e.g. a phantom created by a bad RX). This only frees the
-// slot — it is NOT a permanent block: the next valid frame from that handle re-creates it
-// via addReader(). The persisted UUID is left in NVS so a real reader comes back unchanged.
+// Drop a reader from the list AND remove its binding, so deleting truly un-adopts it: the next frame
+// re-creates it via addReader() as unassigned (greyed), not auto-bound. The persisted UUID is left in NVS
+// so a real reader keeps its identity if you re-bind it later.
 bool gw_delete_reader(const uint8_t handle[3]) {
+  saveAssigned(handle, false);        // remove the persisted binding
+  bool found = false;
   for (auto &r : readers)
-    if (r.used && !memcmp(r.handle, handle, 3)) { r.used = false; return true; }
-  return false;
+    if (r.used && !memcmp(r.handle, handle, 3)) { r.assigned = false; r.haveKey = false; r.used = false; found = true; }
+  return found;
 }
+// Accept (or drop) a reader onto this gateway. Persisted, so it auto-binds/keys on the next announce and
+// after reboots. Dropping also forgets its key so it stops being maintained.
+bool gw_assign_reader(const uint8_t handle[3], bool on) {
+  saveAssigned(handle, on);
+  for (auto &r : readers)
+    if (r.used && !memcmp(r.handle, handle, 3)) {
+      r.assigned = on;
+      if (!on) { r.haveKey = false; r.decoded = false; }
+      return true;
+    }
+  return true;   // persisted even if the reader isn't currently in the live list
+}
+// Open a window during which every announcing reader is auto-accepted (default 3 min from the web button).
+void gw_pair_all(uint16_t seconds) {
+  g_pairUntil = millis() + (uint32_t)seconds * 1000;
+  Serial.printf("[pair] auto-pair window open for %u s\n", seconds);
+}
+uint32_t gw_pair_remaining_s() { return pairWindowActive() ? (g_pairUntil - millis()) / 1000 : 0; }
 
 // default upload interval (seconds) when the user hasn't set one for a reader
 #define OBI_DEFAULT_INTERVAL 10
@@ -301,7 +396,8 @@ static void serveOtaLegacy(const uint8_t handle[3], uint8_t reqCmd, const uint8_
     uint8_t f[80]; size_t n = obi_build_frame(f, handle, rc, b, blen);
     txFrame(f, n, "ota-blk");
     if (pos < g_otaSize) { uint32_t s = pos + 64 > g_otaSize ? g_otaSize : pos + 64; if (s > g_otaServed) g_otaServed = s; }
-    Serial.printf("[ota%u] block @%u  served %u/%u\n", reqCmd, pos, g_otaServed, g_otaSize);
+    if ((g_otaServed & 0x7FF) < 64)   // progress line only every ~2 KB, not every 64 B block
+      Serial.printf("[ota%u] %u/%u\n", reqCmd, g_otaServed, g_otaSize);
   }
 }
 
@@ -452,7 +548,15 @@ static void handleRx() {
   obi_xor(d, len, handle, 3);
   uint8_t cmd = d[3] & 0x3F;
 
-  Serial.printf("\nRX %02X%02X%02X cmd=%u len=%d rssi=%.0f\n", handle[0], handle[1], handle[2], cmd, len, rssi);
+  gw_radio_log('R', handle, cmd, len, (int)rssi, "");   // live radio view (/radio)
+  // Always mark a known reader "seen" on ANY frame it sends (even ones we can't decode / don't ack),
+  // so the UI keeps it fresh whether or not it's assigned/keyed.
+  { Reader *seen = findReader(handle);
+    if (seen) { seen->lastSeenMs = millis(); seen->lastRssi = rssi; } }
+
+  // quiet the per-request RX spam during an active OTA (the reader polls blocks continuously)
+  if (!(gw_ota_active() && (cmd == 20 || cmd == 21 || cmd == 33)))
+    Serial.printf("\nRX %02X%02X%02X cmd=%u len=%d rssi=%.0f\n", handle[0], handle[1], handle[2], cmd, len, rssi);
 
   switch (cmd) {
     // The reader keeps sending its "find gateway" frame between energy reports and needs the
@@ -461,28 +565,31 @@ static void handleRx() {
     case OBI_CMD_READER_ANNOUNCE: {                         // 17 legacy announce -> cmd 49
       Reader *r = addReader(handle); if (!r) break; r->lastRssi = rssi;
       storeAnnounce(r, cmd, d + 4, len - 4);                 // legacy announce carries the UUID too
-      Serial.printf("  %02X%02X%02X announce(17) -> cmd49\n", handle[0], handle[1], handle[2]);
-      sendActivateOld(r); break;
+      Serial.printf("  %02X%02X%02X announce(17)%s\n", handle[0], handle[1], handle[2],
+                    acceptReader(r) ? " -> cmd49" : " (unassigned — greyed, not bound)");
+      if (r->assigned) sendActivateOld(r); break;
     }
     case 18: {                                              // legacy reconnect -> cmd 50
       Reader *r = addReader(handle); if (!r) break; r->lastRssi = rssi;
-      Serial.printf("  %02X%02X%02X reconnect(18) -> cmd50\n", handle[0], handle[1], handle[2]);
-      sendReconnectAck(r, rssi); break;
+      Serial.printf("  %02X%02X%02X reconnect(18)\n", handle[0], handle[1], handle[2]);
+      if (acceptReader(r)) sendReconnectAck(r, rssi); break;
     }
     case 35: {                                              // 1.2.x DevicesScan announce -> cmd 36 + bind
       Reader *r = addReader(handle); if (!r) break; r->lastRssi = rssi;
       storeAnnounce(r, cmd, d + 4, len - 4);                 // grab the 16-byte UUID + type + version
-      Serial.printf("  %02X%02X%02X announce(35) -> cmd36+bind\n", handle[0], handle[1], handle[2]);
-      sendScanAck(r); sendBind(r); break;
+      Serial.printf("  %02X%02X%02X announce(35)%s\n", handle[0], handle[1], handle[2],
+                    acceptReader(r) ? " -> cmd36+bind" : " (unassigned — greyed, not bound)");
+      if (r->assigned) { sendScanAck(r); sendBind(r); } break;
     }
     case 58: {                                              // 1.2.x reconnect -> bind
       Reader *r = addReader(handle); if (!r) break; r->lastRssi = rssi;
-      Serial.printf("  %02X%02X%02X reconnect(58) -> bind\n", handle[0], handle[1], handle[2]);
-      sendBind(r); break;
+      Serial.printf("  %02X%02X%02X reconnect(58)\n", handle[0], handle[1], handle[2]);
+      if (acceptReader(r)) sendBind(r); break;
     }
     case OBI_CMD_ECDH: {                                    // reader's 64-byte pubkey (XOR-decoded in d[])
       Reader *r = addReader(handle);
       if (!r) break;
+      if (!acceptReader(r)) { Serial.println("  ecdh from unassigned reader — ignoring"); break; }
       if (len - 4 < 64) { Serial.println("  ecdh: short pubkey"); break; }
       uint8_t secret[32];
       if (obi_ecdh_compute(d + 4, secret)) {
@@ -516,7 +623,8 @@ static void handleRx() {
       // ACK immediately — the reader is waiting for it and retries at ~5-6 s without it.
       // Normally advertise version 57 (no upgrade); when an OTA is armed for THIS reader, advertise
       // the new version so it resets after 3 acks and pulls the firmware.
-      if (r) {
+      // Only ack ASSIGNED readers — an unassigned one is left to search (so another gateway can take it).
+      if (r && acceptReader(r)) {
         // no-op version = the reader's own reported softver (so it's a no-op both before AND after an
         // OTA, whatever version the new image reports — avoids a reflash loop). OTA target gets the
         // new version to trigger the update.
@@ -532,6 +640,10 @@ static void handleRx() {
           uint8_t rawver = (g_otaActive && !memcmp(r->handle, g_otaTarget, 3)) ? g_otaVersion : 0;
           sendCompletedataRaw(r, cmd | 0x20, rawver);    // ack cmd = energy_cmd | 0x20 (v24: 22->54)
         }
+        // Just assigned a reader that is TEA-paired (has a key on its side from a previous gateway/session)
+        // but we hold no key: nudge it to re-bind + re-ECDH right here in its RX window (the 3 s loop often
+        // misses it). This is what turns "Add" into an actual re-pair on the air.
+        if (!r->haveKey) sendPairAcks(r, rssi);
       }
       size_t plen = (len - 4) & ~0x7u;
       if (r && plen) {
@@ -608,8 +720,9 @@ static inline bool buttonPressed() {
 }
 
 static void doFactoryReset() {
-  Serial.println("\n[btn] factory reset — wiping WiFi + MQTT + reader list");
-  g_uuidStore.begin("obiuuid", false); g_uuidStore.clear(); g_uuidStore.end();  // stored reader UUIDs
+  Serial.println("\n[btn] factory reset — wiping WiFi + MQTT + reader list + assignments");
+  g_uuidStore.begin("obiuuid", false); g_uuidStore.clear(); g_uuidStore.end();      // stored reader UUIDs
+  { Preferences p; p.begin("obiassign", false); p.clear(); p.end(); }                       // reader assignments
   web_factory_reset();                                                          // WiFi + MQTT settings
   for (int i = 0; i < 20; i++) { led_write(i & 1); delay(100); }                // ~2 s blink = confirmed
   Serial.println("[btn] done — rebooting into setup portal");
@@ -642,6 +755,24 @@ static void buttonLoop() {
 }
 #endif // PIN_BUTTON
 
+// Dedicated LoRa task: blocks on the DIO1 IRQ (via g_loraSem), so it wakes instantly to answer a reader
+// and yields the core to web/MQTT when idle. High priority => on the single-core C3 it preempts the web
+// task and hits the reader's tight OTA request→block window (fixes the slow reader OTA on the C3).
+static void loraTask(void *) {
+  static uint32_t lastBeacon = 0, lastScan = 0;
+  for (;;) {
+    xSemaphoreTake(g_loraSem, pdMS_TO_TICKS(20));   // wake on RX/TX IRQ, else tick every 20 ms for the beacon
+    if (g_rx) { g_rx = false; handleRx(); }
+    uint32_t now = millis();
+    bool ota = gw_ota_active();
+    if (now - lastBeacon >= (ota ? 5000u : 1000u)) { lastBeacon = now; sendBeacon(); }
+    if (!ota && now - lastScan >= 3000) { lastScan = now; sendScan(); }
+    if (!ota)                                         // re-pair safety net for assigned, not-yet-keyed readers
+      for (auto &r : readers)
+        if (r.used && r.assigned && !r.haveKey && now - r.lastBind >= 3000) sendPairAcks(&r, r.lastRssi);
+  }
+}
+
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -662,6 +793,7 @@ void setup() {
   radio.setDio2AsRfSwitch(true);
 #endif
   radio.setCRC(2);
+  g_loraSem = xSemaphoreCreateBinary();
   radio.setDio1Action(onDio1);
 
   g_ecdhReady = obi_ecdh_generate(g_ourPub);
@@ -675,14 +807,15 @@ void setup() {
   buttonSetup();   // case button: hold to factory-reset (closed-case OBI_BOARD_OBI_C3)
 #endif
   flash_dbg_uart_begin();   // UART flash console, runs alongside the log (type 'help')
+  // LoRa in its own high-priority task on the Arduino core (preempts web on the single-core C3)
+  xTaskCreatePinnedToCore(loraTask, "lora", 8192, nullptr, 3, nullptr, CONFIG_ARDUINO_RUNNING_CORE);
   web_setup();     // WiFi config portal + web dashboard + MQTT (non-fatal if WiFi is unavailable)
 }
 
+// loop() is now just the low-priority housekeeping — the radio/LoRa lives in loraTask (high priority),
+// so nothing here can delay a reader's OTA response. Yields the core to web/MQTT + LoRa.
 void loop() {
-  static uint32_t lastBeacon = 0, lastScan = 0;
   uint32_t now = millis();
-
-  if (g_rx) { g_rx = false; handleRx(); }
 
 #ifdef PIN_BUTTON
   buttonLoop();   // case button: poll for a >=5 s hold -> factory reset
@@ -704,12 +837,6 @@ void loop() {
   }
   led_loop();
 
-  if (now - lastBeacon >= 1000) { lastBeacon = now; sendBeacon(); }
-  if (now - lastScan   >= 3000) { lastScan   = now; sendScan(); }
-
-  // periodic re-pair safety net for any reader we've heard but not yet keyed
-  for (auto &r : readers)
-    if (r.used && !r.haveKey && now - r.lastBind >= 3000) sendPairAcks(&r, r.lastRssi);
-
   web_loop();     // service the web dashboard + MQTT (both non-blocking)
+  delay(5);       // don't busy-spin — free the single core for the LoRa + web tasks
 }

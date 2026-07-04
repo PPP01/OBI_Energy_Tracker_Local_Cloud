@@ -6,6 +6,8 @@ struct Reader {
   bool     used     = false;
   uint8_t  handle[3];            // 3-byte LoRa id (frame header)
   // pairing state
+  bool     assigned = false;     // user accepted this reader onto THIS gateway (persisted); else it is only
+                                 // shown greyed-out and NOT bound/keyed, so two gateways don't fight over it
   bool     haveKey  = false;
   bool     isOld    = false;
   bool     decoded  = false;
@@ -41,6 +43,14 @@ extern const uint8_t GWID[6];
 void gw_request_interval(const uint8_t handle[3], uint16_t seconds);  // set the reader's upload interval
 bool gw_delete_reader(const uint8_t handle[3]);                       // drop a (phantom) reader; reappears on next RX
 uint32_t gw_uptime_s();
+// reader pairing gating (opt-in): a reader is only bound/keyed once assigned to this gateway
+bool gw_assign_reader(const uint8_t handle[3], bool on);              // accept (or drop) a reader onto this gateway
+void gw_pair_all(uint16_t seconds);                                   // open a window that auto-assigns every reader
+uint32_t gw_pair_remaining_s();                                       // seconds left in the auto-pair window (0 = off)
+
+// live radio log (ring buffer) for the /radio web page
+void   gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, const char *note);  // dir 'R'/'T'
+String gw_radio_json(uint32_t since);                                 // {seq, e:[...]} — entries newer than `since`
 
 // ---- reader firmware OTA over LoRa (serve to the reader's bootloader) --------
 bool     gw_ota_begin(const uint8_t handle[3], uint32_t total, uint8_t version);  // alloc + target a reader
