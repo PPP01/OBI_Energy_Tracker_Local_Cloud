@@ -8,7 +8,7 @@ import os, subprocess, datetime
 
 Import("env")  # noqa: F821  (injected by PlatformIO/SCons)
 
-BASE_VERSION = "1.0"                       # major.minor — raise by hand for a release
+BASE_VERSION = "1.1"                       # major.minor — raise by hand for a release
 
 proj         = env["PROJECT_DIR"]
 counter_file = os.path.join(proj, "version.txt")
