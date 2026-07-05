@@ -1,12 +1,16 @@
 name: Build firmware
 
 # Builds every board variant of the gateway firmware.
-#  - on push / PR / manual  -> build all variants, keep the .bin files as downloadable workflow artifacts (CI check)
-#  - on a PUBLISHED RELEASE  -> build all variants and attach the .bin files to that release
+#  - on push to main      -> build all variants AND publish a GitHub release v1.0.<run_number>
+#                            with the .bin files attached (version is stamped into the firmware too)
+#  - on pull_request      -> build all variants, keep the .bin files as workflow artifacts (CI check only,
+#                            no release)
+#  - on a PUBLISHED RELEASE-> build all variants and attach the .bin files to that release; the firmware's
+#                            reported version is taken from the tag
 #
-# To ship a release: bump BASE_VERSION in open_obi_energy_meter/version.py if you like, then create a
-# release in GitHub (tag e.g. v1.2.0). This workflow compiles all variants and uploads them to the release;
-# the firmware's reported version is taken from the tag (see FW_VERSION_OVERRIDE below).
+# The firmware version is major.minor (BASE_VERSION in open_obi_energy_meter/version.py) + the GitHub run
+# number as the patch, e.g. 1.0.42. Bump BASE_VERSION by hand to raise major/minor; the patch climbs on
+# its own with every workflow run so every release tag is unique and monotonic.
 
 on:
   push:
@@ -23,11 +27,36 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed so the release job can upload assets
+  contents: write   # needed so the release job can create tags / upload assets
 
 jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute firmware version
+        id: v
+        run: |
+          base=$(grep -oP 'BASE_VERSION\s*=\s*"\K[^"]+' open_obi_energy_meter/version.py)
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # a manually published release pins the firmware to its own tag
+            ver="${{ github.ref_name }}"; ver="${ver#v}"
+          else
+            # push / PR / manual dispatch -> major.minor + monotonic run number as patch
+            ver="${base}.${{ github.run_number }}"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v$ver"    >> "$GITHUB_OUTPUT"
+          echo "Firmware version: $ver"
+
   build:
     name: Build ${{ matrix.variant }}
+    needs: version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -57,9 +86,8 @@ jobs:
       - name: Install PlatformIO
         run: pip install --upgrade platformio
 
-      - name: Pin firmware version to the release tag
-        if: github.event_name == 'release'
-        run: echo "FW_VERSION_OVERRIDE=${{ github.ref_name }}" >> "$GITHUB_ENV"
+      - name: Pin firmware version
+        run: echo "FW_VERSION_OVERRIDE=${{ needs.version.outputs.version }}" >> "$GITHUB_ENV"
 
       - name: Build ${{ matrix.variant }}
         working-directory: open_obi_energy_meter
@@ -70,7 +98,7 @@ jobs:
         run: |
           mkdir -p dist
           cp ".pio/build/${{ matrix.variant }}/firmware.bin" \
-             "dist/${{ matrix.variant }}-${{ github.ref_name }}.bin"
+             "dist/${{ matrix.variant }}-${{ needs.version.outputs.version }}.bin"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -80,9 +108,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Attach binaries to release
-    needs: build
-    if: github.event_name == 'release'
+    name: Publish release
+    needs: [ version, build ]
+    # Auto-release on every push to main; also attach to a manually published release.
+    # PRs and plain workflow_dispatch runs only produce artifacts (no release).
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Download all built binaries
@@ -91,8 +123,12 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Attach to the GitHub release
+      - name: Publish / update the GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Firmware ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
           files: dist/*.bin
           fail_on_unmatched_files: true
