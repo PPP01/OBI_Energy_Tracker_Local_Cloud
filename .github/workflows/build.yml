@@ -1,0 +1,98 @@
+name: Build firmware
+
+# Builds every board variant of the gateway firmware.
+#  - on push / PR / manual  -> build all variants, keep the .bin files as downloadable workflow artifacts (CI check)
+#  - on a PUBLISHED RELEASE  -> build all variants and attach the .bin files to that release
+#
+# To ship a release: bump BASE_VERSION in open_obi_energy_meter/version.py if you like, then create a
+# release in GitHub (tag e.g. v1.2.0). This workflow compiles all variants and uploads them to the release;
+# the firmware's reported version is taken from the tag (see FW_VERSION_OVERRIDE below).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'open_obi_energy_meter/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'open_obi_energy_meter/**'
+      - '.github/workflows/build.yml'
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed so the release job can upload assets
+
+jobs:
+  build:
+    name: Build ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - obi_gateway_c3
+          - vision_master_e290
+          - ttgo_tbeam_sx1262
+          - generic_esp32s3
+          - generic_esp32
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('open_obi_energy_meter/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Pin firmware version to the release tag
+        if: github.event_name == 'release'
+        run: echo "FW_VERSION_OVERRIDE=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.variant }}
+        working-directory: open_obi_energy_meter
+        run: pio run -e ${{ matrix.variant }}
+
+      - name: Stage binary
+        working-directory: open_obi_energy_meter
+        run: |
+          mkdir -p dist
+          cp ".pio/build/${{ matrix.variant }}/firmware.bin" \
+             "dist/${{ matrix.variant }}-${{ github.ref_name }}.bin"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}
+          path: open_obi_energy_meter/dist/*.bin
+          if-no-files-found: error
+
+  release:
+    name: Attach binaries to release
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.bin
+          fail_on_unmatched_files: true
