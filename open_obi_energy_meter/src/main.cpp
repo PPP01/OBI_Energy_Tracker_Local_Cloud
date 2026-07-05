@@ -58,6 +58,12 @@ static Reader *findReader(const uint8_t h[3]) {
   for (auto &r : readers) if (r.used && !memcmp(r.handle, h, 3)) return &r;
   return nullptr;
 }
+
+// Handles that are never a real reader — mis-decode/noise artifacts that otherwise show up as phantom
+// entries (e.g. FFFFFD). We drop these frames entirely instead of relying on the stale-prune timeout.
+static inline bool isIgnoredHandle(const uint8_t h[3]) {
+  return h[0] == 0xFF && h[1] == 0xFF && h[2] == 0xFD;   // FFFFFD
+}
 // UUIDs persist in NVS keyed by handle, so a reader keeps its UUID across ESP32 reboots
 // once we've seen it announce (cmd 17/35) at least once.
 static Preferences g_uuidStore;
@@ -97,6 +103,7 @@ static uint32_t g_pairUntil = 0;
 static bool pairWindowActive() { return g_pairUntil && (int32_t)(millis() - g_pairUntil) < 0; }
 
 static Reader *addReader(const uint8_t h[3]) {
+  if (isIgnoredHandle(h)) return nullptr;   // never create a slot for a known phantom id
   Reader *r = findReader(h);
   if (r) return r;
   for (auto &x : readers) if (!x.used) {
@@ -138,17 +145,23 @@ static void hexdump(const uint8_t *p, size_t n) {
 }
 
 // ---- live radio log ring buffer (served by the /radio web page) ------------
-struct Rlog { uint32_t seq, ms; char dir; uint8_t h[3]; int16_t cmd, len, rssi; char note[20]; };
-static const int RLOG_N = 120;
+static const int RAW_MAX = 255;   // store the whole packet (LoRa RX buffer is 256 B) so nothing is truncated
+struct Rlog { uint32_t seq, ms; char dir; uint8_t h[3]; int16_t cmd, len, rssi; char note[20];
+              uint8_t rawLen; uint8_t raw[RAW_MAX]; };
+static const int RLOG_N = 96;     // ~96 * ~280 B ≈ 27 KB RAM; client keeps its own 800-row history anyway
 static Rlog g_rl[RLOG_N];
 static volatile uint32_t g_rlSeq = 0;
 static int g_rlHead = 0;
-void gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, const char *note) {
+void gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, const char *note,
+                  const uint8_t *raw, int rawLen) {
   Rlog &e = g_rl[g_rlHead];
   e.seq = ++g_rlSeq; e.ms = millis(); e.dir = dir;
   if (h) memcpy(e.h, h, 3); else { e.h[0] = e.h[1] = e.h[2] = 0; }
   e.cmd = (int16_t)cmd; e.len = (int16_t)len; e.rssi = (int16_t)rssi;
   strncpy(e.note, note ? note : "", sizeof e.note - 1); e.note[sizeof e.note - 1] = 0;
+  int n = rawLen < 0 ? 0 : (rawLen > RAW_MAX ? RAW_MAX : rawLen);
+  e.rawLen = (uint8_t)n;
+  if (raw && n) memcpy(e.raw, raw, n);
   g_rlHead = (g_rlHead + 1) % RLOG_N;
 }
 String gw_radio_json(uint32_t since) {
@@ -162,7 +175,10 @@ String gw_radio_json(uint32_t since) {
     first = false;
     j += "{\"s\":" + String(e.seq) + ",\"t\":" + String(e.ms) + ",\"d\":\"" + String(e.dir) +
          "\",\"h\":\"" + String(hs) + "\",\"c\":" + String(e.cmd) + ",\"l\":" + String(e.len) +
-         ",\"r\":" + String(e.rssi) + ",\"n\":\"" + String(e.note) + "\"}";
+         ",\"r\":" + String(e.rssi) + ",\"n\":\"" + String(e.note) + "\",\"b\":\"";
+    char bb[3];
+    for (int k = 0; k < e.rawLen; k++) { snprintf(bb, sizeof bb, "%02X", e.raw[k]); j += bb; }
+    j += "\"}";
   }
   return j + "]}";
 }
@@ -172,7 +188,7 @@ static void txFrame(const uint8_t *buf, size_t len, const char *what) {
   int st = radio.transmit((uint8_t *)buf, len);
   radio.startReceive();
   g_rx = false;                 // discard the TxDone that also pulses DIO1
-  gw_radio_log('T', buf, -1, (int)len, 0, what);   // buf[0..2] = target handle (plaintext)
+  gw_radio_log('T', buf, -1, (int)len, 0, what, buf, (int)len);   // buf[0..2] = target handle (plaintext)
   Serial.printf("  TX %-6s len=%d -> %d\n", what, (int)len, st);   // note carries offset+latency for OTA blocks
 }
 
@@ -557,13 +573,15 @@ static void handleRx() {
   float rssi = radio.getRSSI();
   uint8_t handle[3] = { buf[0], buf[1], buf[2] };
 
+  if (isIgnoredHandle(handle)) return;   // phantom id FFFFFD — drop entirely: no radio log, no reader, no reply
+
   // XOR-decode the whole frame (byte3..end) with the handle key — recovers cmd
   // and, for control frames, the plaintext payload (energy payload stays TEA).
   uint8_t d[256]; memcpy(d, buf, len);
   obi_xor(d, len, handle, 3);
   uint8_t cmd = d[3] & 0x3F;
 
-  gw_radio_log('R', handle, cmd, len, (int)rssi, "");   // live radio view (/radio)
+  gw_radio_log('R', handle, cmd, len, (int)rssi, "", d, len);   // live radio view (/radio) — d = XOR-decoded frame
   // Always mark a known reader "seen" on ANY frame it sends (even ones we can't decode / don't ack),
   // so the UI keeps it fresh whether or not it's assigned/keyed.
   { Reader *seen = findReader(handle);

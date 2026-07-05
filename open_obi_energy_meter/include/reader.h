@@ -49,7 +49,8 @@ void gw_pair_all(uint16_t seconds);                                   // open a 
 uint32_t gw_pair_remaining_s();                                       // seconds left in the auto-pair window (0 = off)
 
 // live radio log (ring buffer) for the /radio web page
-void   gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, const char *note);  // dir 'R'/'T'
+void   gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, const char *note,
+                    const uint8_t *raw, int rawLen);                  // dir 'R'/'T'; raw = full packet bytes
 String gw_radio_json(uint32_t since);                                 // {seq, e:[...]} — entries newer than `since`
 
 // ---- reader firmware OTA over LoRa (serve to the reader's bootloader) --------
