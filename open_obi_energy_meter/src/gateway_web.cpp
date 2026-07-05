@@ -8,6 +8,8 @@
 #include <WiFiManager.h>          // tzapu/WiFiManager
 #include <WebServer.h>
 #include <Update.h>               // ESP32 self-OTA (reflash our own app into the other OTA slot)
+#include <HTTPClient.h>           // pull the latest release .bin from GitHub (settings -> firmware)
+#include <WiFiClientSecure.h>     // HTTPS to api.github.com / release asset host
 #include <esp_partition.h>        // partition list for the /debug hex editor
 #include <esp_mac.h>              // base MAC for the per-device setup-AP name
 #include <soc/soc_caps.h>         // SOC_TEMP_SENSOR_SUPPORTED (internal temperature sensor)
@@ -305,9 +307,7 @@ footer b{font-family:var(--mono);color:var(--txt)}
 <div class="htop"><div class="logo">⚡</div><div><h1>Open OBI Energy Tracker<a class="ghlink" href="https://github.com/atc1441/OBI_Energy_Tracker_Local_Cloud" target="_blank" rel="noopener" title="View this project on GitHub">GitHub ↗</a></h1><div class="sub" id="sub"></div></div>
 <div class="spacer"></div>
 <div class="seg"><button id="lde" onclick="setLang('de')">DE</button><button id="len" onclick="setLang('en')">EN</button></div>
-<button class="icon" onclick="tog('wf')" title="Configure WiFi — scan networks and connect (no AP switch needed)">📶 WiFi</button>
-<button class="icon" onclick="tog('mq')" title="MQTT settings">⚙ MQTT</button>
-<button class="icon" onclick="location.href='/update'" title="Upload a new firmware .bin (OTA self-update)">⬆ Firmware</button>
+<button class="icon" onclick="location.href='/settings'" title="WiFi, MQTT &amp; Firmware-Einstellungen">⚙ Settings</button>
 <button class="icon" onclick="location.href='/history'" title="Energie-Historie &amp; Tagesverbrauch pro Reader">📈 History</button>
 <button class="icon" onclick="location.href='/radio'" title="Live LoRa radio messages">📡 Radio</button>
 <button class="icon" onclick="location.href='/debug'" title="Flash hex editor / eFuses / debug">🐞 Debug</button>
@@ -315,40 +315,6 @@ footer b{font-family:var(--mono);color:var(--txt)}
 <div class="bar" id="bar"></div>
 </header>
 <div class="wrap">
- <div class="panel" id="mq">
-  <h2 id="mqtt_h"></h2><div class="sub" id="mqtt_stat"></div>
-  <div class="grid2">
-   <div><label id="l_host"></label><input id="c_host" placeholder="192.168.1.10"></div>
-   <div><label id="l_port"></label><input id="c_port" type="number"></div>
-   <div><label id="l_user"></label><input id="c_user"></div>
-   <div><label id="l_pass"></label><input id="c_pass" type="password" placeholder="••••"></div>
-   <div style="grid-column:1/3"><label id="l_topic"></label><input id="c_topic" style="width:100%"></div>
-  </div>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-   <button class="b" onclick="saveMqtt()" id="b_save"></button>
-   <button class="g" onclick="rediscover()" id="b_disc"></button>
-   <span class="sub" id="disc_msg" style="margin:0"></span>
-  </div>
-  <div class="sub" id="mqtt_cmd" style="margin-top:10px"></div>
- </div>
- <div class="panel" id="wf">
-  <h2>WiFi</h2>
-  <div class="grid2">
-   <div style="grid-column:1/3"><label id="l_wnet">Network (scan)</label>
-    <div style="display:flex;gap:8px">
-     <select id="wf_ssid" onchange="wifiPick()" style="flex:1"><option value="">— scan for networks —</option></select>
-     <button class="g" id="wf_scanb" onclick="scanWifi()">Scan</button>
-    </div></div>
-   <div><label id="l_wman">…or type SSID</label><input id="wf_manual" placeholder="MyNetwork"></div>
-   <div><label id="l_wpass">Password</label><input id="wf_pass" type="password" placeholder="••••"></div>
-  </div>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-   <button class="b" onclick="wifiConnect()" id="wf_conn">Connect</button>
-   <button class="g" onclick="wifiPortal()" id="wf_portal">Setup portal (AP)</button>
-   <span class="sub" id="wf_msg" style="margin:0"></span>
-  </div>
-  <div class="sub" id="wf_note" style="margin-top:8px"></div>
- </div>
  <div class="pairbar"><button class="b" id="pair_btn" onclick="pairAll()"></button><span class="meta" id="pair_st"></span></div>
  <div class="list" id="list"></div>
  <footer><span id="ft"></span> · <b id="gw"></b></footer>
@@ -401,16 +367,7 @@ const T={
 let lang=localStorage.getItem('lang')||'de',L=T[lang];
 function setLang(x){lang=x;L=T[x];localStorage.setItem('lang',x);applyLang();tick();}
 function applyLang(){$('#lde').className=lang=='de'?'act':'';$('#len').className=lang=='en'?'act':'';
- $('#mqtt_h').textContent=L.mqcfg;$('#l_host').textContent=L.host;
- $('#l_port').textContent=L.port;$('#l_user').textContent=L.user;$('#l_pass').textContent=L.pass;
- $('#l_topic').textContent=L.topic;$('#b_save').textContent=L.save;$('#b_disc').textContent=L.disc;
- var de=lang=='de';
- $('#l_wnet').textContent=de?'Netzwerk (Scan)':'Network (scan)';$('#wf_scanb').textContent=de?'Scannen':'Scan';
- $('#l_wman').textContent=de?'…oder SSID eingeben':'…or type SSID';$('#l_wpass').textContent=L.pass;
- $('#wf_conn').textContent=de?'Verbinden':'Connect';$('#wf_portal').textContent=de?'Setup-Portal (AP)':'Setup portal (AP)';
- $('#wf_note').textContent=de?'Der Scan pausiert das Dashboard kurz. Ändert sich die IP nach dem Verbinden, öffne das Dashboard unter der neuen IP (siehe Serial-Log / E-Paper).':'Scanning briefly pauses the dashboard. If the IP changes after connecting, reopen the dashboard at the new IP (serial log / e-paper).';
  $('#pair_btn').textContent=L.pairall;}
-function tog(id){$('#'+id).classList.toggle('open')}
 function rebootGw(){if(!confirm(lang=='de'?'Gateway jetzt neu starten?':'Restart the gateway now?'))return;
  fetch('/api/reboot',{method:'POST'}).catch(()=>{});
  alert(lang=='de'?'Neustart läuft… in ~10 s wieder erreichbar.':'Restarting… back in ~10 s.');}
@@ -455,9 +412,6 @@ async function tick(){try{
  ].concat(st.temp_c!=null?[['Temp',`<b>${st.temp_c} °C</b>`]]:[])
   .map(p=>`<div class="pill"><span class="k">${p[0]}</span>${p[1]}</div>`).join('');
  $('#pair_st').textContent=st.pair_remaining_s>0?L.pairon.replace('%s',st.pair_remaining_s):L.pairoff;
- $('#mqtt_stat').innerHTML=q.enabled?(q.connected?`<span class="dot on"></span>${L.con}`:`<span class="dot off"></span>${L.dis} — ${q.state}`):`<span class="dot idle"></span>${L.disabled}`;
- $('#mqtt_cmd').innerHTML=`${L.cmdhint}<br><code>${q.topic}/&lt;id&gt;/set_interval</code> ← <code>30</code><br><code>${q.topic}/gateway/${st.gw}/reboot</code> ← <code>reboot</code>`;
- if(!cfgLoaded){cfgLoaded=true;$('#c_host').value=q.host;$('#c_port').value=q.port;$('#c_user').value=q.user;$('#c_topic').value=q.topic;}
  // don't blow away a reader card while its interval/file input is focused (you'd never finish typing)
  const ae=document.activeElement, editing=ae&&/^(iv_|fw_)/.test(ae.id||'');
  if(!editing && !uploading) $('#list').innerHTML=rs.length?rs.map(card).join(''):`<div class="card"><div class="hd"><span class="id">—</span></div><div class="uuid" style="border:0;background:0">${L.waiting}</div></div>`;
@@ -612,7 +566,7 @@ static void handleSelfOtaDone() {
 static void handleUpdatePage() {   // firmware self-update uploader (dark theme, upload progress)
   server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Firmware Update</title><style>
-:root{--bg:#0b0f0c;--panel:#121814;--panel2:#161d18;--line:#26332b;--txt:#d7e0d8;--dim:#8aa;--accent:#39e08a;--mono:ui-monospace,Menlo,Consolas,monospace}
+:root{--bg:#0a0e14;--panel:#141a23;--panel2:#1b2430;--line:#232e3c;--txt:#eaf0f7;--dim:#7d8da0;--accent:#31d07a;--mono:ui-monospace,Menlo,Consolas,monospace}
 *{box-sizing:border-box}body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
 header{display:flex;align-items:center;gap:12px;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
 header b{font-size:15px}header a{color:var(--accent);text-decoration:none;font-size:13px;margin-left:auto}
@@ -644,6 +598,239 @@ if(ok)setTimeout(()=>location.href='/',9000);else $('go').disabled=false;};
 x.onerror=()=>{$('st').textContent='connection lost (device may be rebooting)';setTimeout(()=>location.href='/',9000);};
 x.send(fd);}
 </script></body></html>)HTML");
+}
+
+// ---- GitHub release check + self-update from GitHub -------------------------------------------------
+// The gateway can pull its own newest release .bin straight from GitHub (built by .github/workflows/build.yml,
+// asset named "<board-target>-<tag>.bin"). HTTPS via WiFiClientSecure(setInsecure) — no cert bundle needed.
+#define GH_LATEST_URL "https://api.github.com/repos/atc1441/OBI_Energy_Tracker_Local_Cloud/releases/latest"
+
+// compare dotted numeric versions (leading 'v' tolerated); true if a > b.
+static bool verNewer(const char *a, const char *b) {
+  while (*a == 'v' || *a == 'V') a++;
+  while (*b == 'v' || *b == 'V') b++;
+  while (*a || *b) {
+    long na = 0, nb = 0;
+    while (*a && *a != '.') { if (*a >= '0' && *a <= '9') na = na * 10 + (*a - '0'); a++; }
+    while (*b && *b != '.') { if (*b >= '0' && *b <= '9') nb = nb * 10 + (*b - '0'); b++; }
+    if (na != nb) return na > nb;
+    if (*a == '.') a++;
+    if (*b == '.') b++;
+  }
+  return false;
+}
+// pull a "key":"value" string out of a (small) JSON body
+static String jsonField(const String &body, const char *key) {
+  String pat = String("\"") + key + "\"";
+  int i = body.indexOf(pat); if (i < 0) return "";
+  i = body.indexOf(':', i + pat.length()); if (i < 0) return "";
+  i++; while (i < (int)body.length() && (body[i] == ' ' || body[i] == '"')) i++;
+  int j = i; while (j < (int)body.length() && body[j] != '"') j++;
+  return body.substring(i, j);
+}
+// find the browser_download_url whose FILENAME matches THIS board target (asset name = "<target>-<ver>.bin").
+// Match "/<target>-" so the filename must *start* with the exact target — otherwise e.g. "generic_esp32"
+// would also match "generic_esp32s3-...". The '/' before it is the last path separator of the download URL.
+static String findAssetUrl(const String &body, const char *target) {
+  String want = String("/") + target + "-";
+  int from = 0; const char *key = "\"browser_download_url\"";
+  for (;;) {
+    int i = body.indexOf(key, from); if (i < 0) return "";
+    int q1 = body.indexOf('"', body.indexOf(':', i) + 1);
+    int q2 = body.indexOf('"', q1 + 1); if (q1 < 0 || q2 < 0) return "";
+    String url = body.substring(q1 + 1, q2);
+    if (url.indexOf(want) >= 0) return url;
+    from = q2 + 1;
+  }
+}
+// GET the latest-release JSON; fill tag + the asset download URL for this board target. false if unavailable.
+// codeOut (optional) receives the HTTP status (or negative HTTPClient error / 0 if we couldn't even connect).
+static bool githubLatest(String &tag, String &url, int *codeOut = nullptr) {
+  if (codeOut) *codeOut = 0;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure cli; cli.setInsecure();
+  HTTPClient http; http.setUserAgent("OBI-Gateway");
+  http.setConnectTimeout(9000); http.setTimeout(12000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  if (!http.begin(cli, GH_LATEST_URL)) return false;
+  http.addHeader("Accept", "application/vnd.github+json");
+  int code = http.GET();
+  if (codeOut) *codeOut = code;
+  if (code != 200) { Serial.printf("[gh] latest -> HTTP %d\n", code); http.end(); return false; }
+  String body = http.getString();
+  http.end();
+  tag = jsonField(body, "tag_name");
+  url = findAssetUrl(body, FW_BUILD_TARGET);
+  return tag.length() > 0;
+}
+static void handleGithubLatest() {
+  String tag, url; int code = 0;
+  if (!githubLatest(tag, url, &code)) { server.send(200, "application/json", String("{\"ok\":false,\"code\":") + code + "}"); return; }
+  bool newer = verNewer(tag.c_str(), FW_VERSION);
+  String j = "{\"ok\":true,\"version\":" + jstr(tag.c_str()) + ",\"current\":\"" + FW_VERSION +
+             "\",\"asset\":" + String(url.length() ? "true" : "false") +
+             ",\"newer\":" + String(newer ? "true" : "false") + "}";
+  server.send(200, "application/json", j);
+}
+// Download this board's newest release .bin from GitHub and flash it. Server picks the URL itself (only ever
+// its own repo's asset). Streams into the OTA slot; Update validates, so a bad/short image is rejected and the
+// running firmware is kept (brick-safe).
+static void handleGithubUpdate() {
+  String tag, url;
+  if (!githubLatest(tag, url) || !url.length()) { server.send(200, "application/json", "{\"ok\":false,\"err\":\"noasset\"}"); return; }
+  WiFiClientSecure cli; cli.setInsecure();
+  HTTPClient http; http.setUserAgent("OBI-Gateway");
+  http.setConnectTimeout(10000); http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  if (!http.begin(cli, url)) { server.send(200, "application/json", "{\"ok\":false,\"err\":\"begin\"}"); return; }
+  int code = http.GET();
+  int len = http.getSize();
+  Serial.printf("[ghota] GET %s -> %d len=%d\n", url.c_str(), code, len);
+  if (code != 200 || len <= 0) { http.end(); server.send(200, "application/json", String("{\"ok\":false,\"code\":") + code + "}"); return; }
+  if (!Update.begin(len)) { Update.printError(Serial); http.end(); server.send(200, "application/json", "{\"ok\":false,\"err\":\"begin\"}"); return; }
+  size_t written = Update.writeStream(http.getStream());
+  bool ok = (written == (size_t)len) && Update.end(true);
+  if (!ok) Update.printError(Serial);
+  http.end();
+  Serial.printf("[ghota] wrote %u/%d ok=%d\n", (unsigned)written, len, ok);
+  server.sendHeader("Connection", "close");
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"write\"}");
+  if (ok) { delay(300); ESP.restart(); }
+}
+
+// ---- /settings — WiFi, MQTT and Firmware in one tidy place ------------------------------------------
+static const char SETTINGS_HTML[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Settings</title><style>
+:root{--bg:#0a0e14;--panel:#141a23;--panel2:#1b2430;--line:#232e3c;--txt:#eaf0f7;--dim:#7d8da0;--accent:#31d07a;--amber:#e3b341;--red:#f0616d;--mono:ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box}body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
+header{display:flex;align-items:center;gap:12px;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+header b{font-size:15px}header a{color:var(--accent);text-decoration:none;font-size:13px;margin-left:12px}
+.seg{margin-left:auto;display:flex;background:var(--panel2);border:1px solid var(--line);border-radius:9px;overflow:hidden}.seg button{background:transparent;border:0;border-radius:0;color:var(--dim);padding:7px 12px;cursor:pointer;font-size:13px;font-weight:600}.seg button.act{background:var(--accent);color:#04140a}
+.wrap{max-width:44rem;margin:22px auto;padding:0 14px;display:flex;flex-direction:column;gap:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+h3{margin:0 0 10px;font-size:16px}
+label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+input,select{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px 10px;font-size:14px;font-family:inherit}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+button{background:var(--accent);border:0;color:#052012;font-weight:700;border-radius:9px;padding:9px 16px;cursor:pointer;font-size:14px}
+button.g{background:var(--panel2);color:var(--txt);border:1px solid var(--line);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.stat{font-size:13px;color:var(--dim);margin-bottom:6px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.on{background:var(--accent)}.off{background:var(--red)}.idle{background:#5b6b60}
+.msg{font-size:12.5px;color:var(--dim)}hr{border:0;border-top:1px solid var(--line);margin:16px 0}
+.bar{height:9px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:12px 0 6px;display:none}
+.bar.on{display:block}.fill{height:100%;width:0;background:var(--accent);transition:width .15s}
+.upd{background:linear-gradient(90deg,rgba(49,208,122,.16),rgba(49,208,122,.04));border:1px solid var(--accent);border-radius:11px;padding:14px;margin:6px 0 2px}
+.upd b{color:var(--accent);font-size:15px}.upd button{margin-top:10px;width:100%;padding:12px;font-size:15px}
+.okrow{color:var(--accent)}code{color:var(--accent);font-family:var(--mono)}
+</style></head><body>
+<header><b>Open OBI Energy Tracker · ⚙ Settings</b><span class=seg><button id=lde onclick="setL('de')">DE</button><button id=len onclick="setL('en')">EN</button></span><a href="/">← Dashboard</a></header>
+<div class=wrap>
+
+ <div class=card id=cwifi>
+  <h3>📶 WiFi</h3>
+  <div class=stat id=wfstat>…</div>
+  <label id=lnet>Netzwerk (Scan)</label>
+  <div style="display:flex;gap:8px"><select id=ssid style="flex:1"><option value="">— scan —</option></select>
+   <button class=g id=bscan onclick=scan()>Scan</button></div>
+  <label id=lman>…oder SSID eingeben</label><input id=man placeholder=MyNetwork>
+  <label id=lwpass>Passwort</label><input id=wpass type=password placeholder=••••>
+  <div class=row><button onclick=connect()><span id=bconn>Verbinden &amp; speichern</span></button>
+   <button class=g onclick=portal()><span id=bportal>Setup-Portal (AP)</span></button>
+   <span class=msg id=wfmsg></span></div>
+ </div>
+
+ <div class=card>
+  <h3>⚙ MQTT</h3>
+  <div class=stat id=mqstat>…</div>
+  <div class=grid>
+   <div><label id=lhost>Server</label><input id=mh placeholder=192.168.1.10></div>
+   <div><label>Port</label><input id=mp type=number placeholder=1883></div>
+   <div><label id=luser>Benutzer</label><input id=mu></div>
+   <div><label id=lpass>Passwort</label><input id=mpw type=password placeholder=••••></div>
+  </div>
+  <label id=ltopic>Basis-Topic</label><input id=mt placeholder=obi/gateway>
+  <div class=row><button onclick=saveMqtt()><span id=bmsave>Speichern</span></button>
+   <button class=g onclick=disc()><span id=bdisc>Discovery senden</span></button>
+   <span class=msg id=mqmsg></span></div>
+ </div>
+
+ <div class=card>
+  <h3>⬆ Firmware</h3>
+  <div class=stat id=fwcur>…</div>
+  <div id=ghbox class=msg>GitHub wird geprüft…</div>
+  <hr>
+  <label id=lman2>Manuell flashen (.bin dieses Boards)</label>
+  <input type=file id=file accept=.bin>
+  <div class=bar id=bar><div class=fill id=fill></div></div>
+  <div class=msg id=upmsg></div>
+  <div class=row><button id=upbtn onclick=upload()><span id=bflash>Flashen &amp; neustart</span></button></div>
+ </div>
+
+</div>
+<script>
+const $=i=>document.getElementById(i);
+const de=(localStorage.getItem('lang')||'de')=='de';
+const t=(d,e)=>de?d:e;
+function setL(x){localStorage.setItem('lang',x);location.reload();}   // switch language + re-render
+$('l'+(de?'de':'en')).className='act';                                // mark the active language button
+// localise the few static labels for EN users
+$('lnet').textContent=t('Netzwerk (Scan)','Network (scan)');$('bscan').textContent=t('Scan','Scan');
+$('lman').textContent=t('…oder SSID eingeben','…or type SSID');$('lwpass').textContent=t('Passwort','Password');
+$('bconn').textContent=t('Verbinden & speichern','Connect & save');$('bportal').textContent=t('Setup-Portal (AP)','Setup portal (AP)');
+$('lhost').textContent=t('Server','Server');$('luser').textContent=t('Benutzer','User');$('lpass').textContent=t('Passwort','Password');
+$('ltopic').textContent=t('Basis-Topic','Base topic');$('bmsave').textContent=t('Speichern','Save');$('bdisc').textContent=t('Discovery senden','Send discovery');
+$('lman2').textContent=t('Manuell flashen (.bin dieses Boards)','Manual flash (.bin for this board)');$('bflash').textContent=t('Flashen & neustart','Flash & reboot');
+let cfg=false;
+async function load(){try{
+  const s=await(await fetch('/api/status')).json();
+  $('wfstat').innerHTML=s.wifi?`<span class="dot on"></span>${t('Verbunden','Connected')} · ${s.ip} · ${s.wifi_rssi} dBm`:`<span class="dot off"></span>${t('nicht verbunden','offline')}`;
+  const q=s.mqtt;
+  $('mqstat').innerHTML=!q.enabled?`<span class="dot idle"></span>${t('deaktiviert','disabled')}`:q.connected?`<span class="dot on"></span>${t('verbunden','connected')} · ${q.host}`:`<span class="dot off"></span>${t('getrennt','disconnected')} — ${q.state}`;
+  if(!cfg){cfg=true;$('mh').value=q.host||'';$('mp').value=q.port||1883;$('mu').value=q.user||'';$('mt').value=q.topic||'';}
+  $('fwcur').innerHTML=`${t('Aktuell','Current')}: <code>${s.fw?s.fw.version:'?'}</code> (${s.fw?s.fw.target:''})`;
+}catch(e){}}
+async function scan(){$('wfmsg').textContent=t('suche…','scanning…');$('bscan').disabled=true;
+ try{let n=await(await fetch('/api/wifi/scan')).json();n.sort((a,b)=>b.rssi-a.rssi);let seen={},o=`<option value="">${t('— Netzwerk wählen —','— pick a network —')}</option>`;
+  for(let x of n){if(!x.ssid||seen[x.ssid])continue;seen[x.ssid]=1;o+=`<option>${x.ssid} (${x.rssi} dBm)${x.enc?' 🔒':''}</option>`;}
+  $('ssid').innerHTML=o;
+  if($('ssid').options.length>1){$('ssid').selectedIndex=1;$('ssid').onchange();}  // auto-pick the strongest so fresh results are obvious
+  $('wfmsg').textContent=Object.keys(seen).length+t(' Netzwerke',' networks');}
+ catch(e){$('wfmsg').textContent=t('Scan fehlgeschlagen','scan failed');}$('bscan').disabled=false;}
+$('ssid').onchange=()=>{let v=$('ssid').value.replace(/ \(.*/,'');if(v)$('man').value=v;};
+async function connect(){let s=$('man').value.trim()||$('ssid').value.replace(/ \(.*/,'');if(!s){$('wfmsg').textContent=t('SSID wählen','pick an SSID');return;}
+ $('wfmsg').textContent=t('verbinde mit ','connecting to ')+s+'…';
+ try{await fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent($('wpass').value)});}catch(e){}
+ $('wfmsg').textContent=t('verbinde… ändert sich die IP, öffne das Dashboard unter der neuen IP.','connecting… if the IP changes, reopen at the new IP.');}
+function portal(){fetch('/api/wifi',{method:'POST'}).then(r=>r.json()).then(d=>{alert((de?'Portal gestartet auf WLAN: ':'Portal on WiFi: ')+d.ssid+'\nhttp://192.168.4.1/');}).catch(()=>{});}
+async function saveMqtt(){const b=new URLSearchParams();b.set('host',$('mh').value);b.set('port',$('mp').value||1883);b.set('user',$('mu').value);b.set('topic',$('mt').value);if($('mpw').value)b.set('pass',$('mpw').value);
+ $('mqmsg').textContent='…';await fetch('/api/mqtt',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:b});$('mpw').value='';$('mqmsg').textContent=t('gespeichert ✓','saved ✓');setTimeout(()=>$('mqmsg').textContent='',3000);load();}
+async function disc(){$('mqmsg').textContent='…';try{const r=await(await fetch('/api/rediscover',{method:'POST'})).json();$('mqmsg').textContent=r.ok?t('Discovery gesendet ✓','discovery sent ✓')+' ('+r.count+')':t('MQTT nicht verbunden','MQTT not connected');}catch(e){$('mqmsg').textContent='error';}setTimeout(()=>$('mqmsg').textContent='',4000);}
+async function ghCheck(){const box=$('ghbox');box.className='msg';box.textContent=t('GitHub wird geprüft…','checking GitHub…');
+ try{const r=await(await fetch('/api/github/latest')).json();
+  if(!r.ok){box.textContent=t('Keine Release-Info von GitHub (evtl. noch kein Release veröffentlicht).','No release info from GitHub (maybe no release published yet).');return;}
+  if(r.newer&&r.asset){box.className='upd';box.innerHTML=`<b>⬆ ${t('Update verfügbar','Update available')}: ${r.version}</b><br><span class=msg>${t('Aktuell','current')}: ${r.current}</span><button onclick=ghUpdate()>${t('Jetzt aktualisieren','Update now')}</button>`;}
+  else if(r.newer&&!r.asset){box.textContent=`${t('Release','Release')} ${r.version} ${t('gefunden, aber kein Build für dieses Board im Release.','found, but no build for this board in the release.')}`;}
+  else{box.className='msg okrow';box.innerHTML=`✓ ${t('Aktuell','Up to date')} (${r.current}) — ${t('neuestes Release','latest release')}: ${r.version}`;}
+ }catch(e){box.textContent=t('GitHub-Prüfung fehlgeschlagen','GitHub check failed');}}
+async function ghUpdate(){if(!confirm(t('Firmware von GitHub laden und flashen? Das Gerät startet danach neu.','Download & flash firmware from GitHub? The device reboots afterwards.')))return;
+ const box=$('ghbox');box.className='msg';box.innerHTML='⏳ '+t('lade & flashe von GitHub… (nicht trennen, ~1–2 Min)','downloading & flashing from GitHub… (do not disconnect, ~1–2 min)');
+ try{const r=await(await fetch('/api/github/update',{method:'POST'})).json();
+  if(r.ok){box.innerHTML='✓ '+t('geflasht — Neustart läuft…','flashed — rebooting…');setTimeout(()=>location.href='/',10000);}
+  else{box.className='msg';box.textContent=t('Update fehlgeschlagen','update failed')+' ('+(r.err||r.code||'?')+') — '+t('aktuelle Firmware bleibt.','current firmware kept.');}
+ }catch(e){box.innerHTML='… '+t('Verbindung verloren (evtl. Neustart) — in 10 s zum Dashboard.','connection lost (maybe rebooting) — dashboard in 10 s.');setTimeout(()=>location.href='/',10000);}}
+function upload(){let f=$('file').files[0];if(!f){$('upmsg').textContent=t('erst eine .bin wählen','pick a .bin first');return;}
+ $('upbtn').disabled=true;$('bar').classList.add('on');$('upmsg').textContent=t('lade hoch','uploading')+' '+f.name+'…';
+ let fd=new FormData();fd.append('firmware',f);let x=new XMLHttpRequest();x.open('POST','/api/selfupdate');
+ x.upload.onprogress=e=>{if(e.lengthComputable){let p=e.loaded/e.total*100;$('fill').style.width=p+'%';$('upmsg').textContent=t('lade hoch ','uploading ')+(p|0)+'%';}};
+ x.onload=()=>{let ok=false;try{ok=JSON.parse(x.responseText).ok;}catch(e){}$('fill').style.width='100%';$('upmsg').textContent=ok?t('geschrieben — Neustart…','written — rebooting…'):t('Update fehlgeschlagen (Image abgelehnt).','update failed (image rejected).');if(ok)setTimeout(()=>location.href='/',9000);else $('upbtn').disabled=false;};
+ x.onerror=()=>{$('upmsg').textContent=t('Verbindung verloren (evtl. Neustart)','connection lost (maybe rebooting)');setTimeout(()=>location.href='/',9000);};
+ x.send(fd);}
+load();ghCheck();
+</script></body></html>)HTML";
+static void handleSettingsPage() {
+  server.send_P(200, "text/html", SETTINGS_HTML);
 }
 
 // ---- flash debug: raw read / patch / erase over HTTP (backs the /debug hex editor, all boards) -------
@@ -780,7 +967,7 @@ setInterval(poll,600);poll();
 static void handleDebugPage() {
   server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Flash Debug</title><style>
-:root{--bg:#0b0f0c;--panel:#121814;--panel2:#161d18;--line:#26332b;--txt:#d7e0d8;--dim:#8aa;--accent:#39e08a;--amber:#ffd166;--red:#ff6b6b;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+:root{--bg:#0a0e14;--panel:#141a23;--panel2:#1b2430;--line:#232e3c;--txt:#eaf0f7;--dim:#7d8da0;--accent:#31d07a;--amber:#e3b341;--red:#f0616d;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 *{box-sizing:border-box}body{font-family:system-ui,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
 header{display:flex;align-items:center;gap:12px;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
 header b{font-size:15px}header a{color:var(--accent);text-decoration:none;font-size:13px}.sp{flex:1}
@@ -1423,7 +1610,10 @@ static void startServices() {
   server.on("/api/delete", HTTP_POST, handleDelete);
   server.on("/api/ota", HTTP_POST, handleOtaDone, handleOtaUpload);   // reader firmware over LoRa
   server.on("/api/ota_cancel", HTTP_POST, handleOtaCancel);
-  server.on("/update", HTTP_GET, handleUpdatePage);                   // ESP32 self-update page
+  server.on("/settings",        HTTP_GET,  handleSettingsPage);       // WiFi + MQTT + firmware in one page
+  server.on("/api/github/latest", HTTP_GET,  handleGithubLatest);     // check GitHub for the newest release
+  server.on("/api/github/update", HTTP_POST, handleGithubUpdate);     // pull + flash the newest release .bin
+  server.on("/update", HTTP_GET, handleUpdatePage);                   // ESP32 self-update page (still linked from /settings)
   server.on("/api/selfupdate", HTTP_POST, handleSelfOtaDone, handleSelfOtaUpload);
   server.on("/debug", HTTP_GET, handleDebugPage);                     // flash hex editor
   server.on("/api/flash/info",  HTTP_GET,  handleFlashInfo);

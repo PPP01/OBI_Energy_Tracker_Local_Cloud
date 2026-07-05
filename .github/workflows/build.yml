@@ -72,6 +72,7 @@ jobs:
           - ttgo_tbeam_sx1262
           - generic_esp32s3
           - generic_esp32
+          - xiao_esp32s3
     steps:
       - uses: actions/checkout@v4
 
