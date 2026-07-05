@@ -265,6 +265,39 @@ button.g{background:transparent;color:var(--txt);border:1px solid var(--line);bo
 .grid2 input{width:100%}
 footer{color:var(--dim);font-size:12px;text-align:center;padding:26px}
 footer b{font-family:var(--mono);color:var(--txt)}
+/* ---------- phone / narrow screens ---------- */
+@media (max-width:760px){
+ header{padding:11px 13px;position:static}   /* scroll away with the page (don't eat fixed height) */
+ .htop{flex-wrap:wrap;gap:9px 10px}          /* title + toolbar wrap instead of overflowing */
+ .spacer{display:none}
+ h1{font-size:15px}
+ .sub{font-size:11px;line-height:1.35}
+ .ghlink{margin-left:6px}
+ .seg button{padding:9px 13px;font-size:13px}       /* comfy touch targets */
+ .icon{padding:9px 11px;font-size:14px;flex:1 1 auto;text-align:center}  /* toolbar buttons share width & wrap */
+ .bar{gap:7px;margin-top:11px}
+ .pill{flex:1 1 calc(50% - 4px);white-space:normal;padding:8px 10px;font-size:12px}  /* 2-up status pills */
+ .wrap{padding:14px 12px}
+ .list{gap:11px}
+ .card{padding:13px 13px;border-radius:13px}
+ .hd .id{font-size:16px}
+ .uuid{font-size:11px;margin:6px 0 11px}
+ .mx{grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:6px}
+ .grid2{grid-template-columns:1fr;gap:10px}          /* config forms: single column */
+ input{font-size:16px}                               /* >=16px stops iOS focus-zoom */
+ .ctrl{gap:8px}
+ .ctrl input{width:auto}
+ .ctrl input[type=number]{flex:1 1 auto;min-width:96px}
+ .ctrl input[type=file]{flex:1 1 100%;min-width:0}   /* file picker gets its own row */
+ .ctrl button.g{flex:1 1 auto;min-width:104px}
+ button.b,button.g{padding:11px 15px}
+ .ctrl .meta{flex:1 1 100%}
+ footer{padding:22px 12px}
+}
+@media (max-width:400px){
+ .icon{flex:1 1 calc(50% - 5px)}                     /* 2-up toolbar buttons on tiny phones */
+ .seg{flex:1 1 100%}.seg button{flex:1}              /* DE/EN full width */
+}
 </style></head><body>
 <header>
 <div class="htop"><div class="logo">⚡</div><div><h1>Open OBI Energy Tracker<a class="ghlink" href="https://github.com/atc1441/OBI_Energy_Tracker_Local_Cloud" target="_blank" rel="noopener" title="View this project on GitHub">GitHub ↗</a></h1><div class="sub" id="sub"></div></div>
@@ -704,6 +737,16 @@ th{color:var(--dim);text-align:left;font-weight:600;padding:4px 8px;border-botto
 td{padding:2px 8px;border-bottom:1px solid #172030;white-space:nowrap}
 tr.T td{color:var(--tx)}tr.R td{color:var(--txt)}.hl{color:var(--rx)}.dim{color:var(--dim)}
 .d{font-weight:700}.filt{width:110px;background:#1b2430;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:6px 8px;font-family:var(--mono);font-size:12px}
+@media (max-width:760px){
+ header{flex-wrap:wrap;position:static;gap:8px;padding:11px 13px}  /* scroll away, don't overflow */
+ .sp{display:none}
+ .filt{flex:1 1 130px;font-size:16px}          /* fills row, >=16px stops iOS zoom */
+ header button{flex:1 1 auto;padding:9px 12px}
+ header a{margin-left:auto}
+ .wrap{padding:10px 12px;overflow-x:auto}       /* table scrolls sideways, page doesn't */
+ th{position:static}
+ table{font-size:12px}td,th{padding:3px 7px}
+}
 </style></head><body>
 <header><b>📡 Radio live</b><span class=dim id=stat></span><span class=sp></span>
 <input class=filt id=filt placeholder="filter id/cmd"><button id=pause onclick=togglePause()>⏸ Pause</button>
@@ -758,6 +801,18 @@ table.hex td{padding:0 2px;text-align:center}td.off{color:var(--accent);padding:
 #efuse.show{display:block}#efuse table{border-collapse:collapse}#efuse td{padding:2px 14px 2px 0}
 .ok{color:var(--accent)}.bad{color:var(--red);font-weight:700}
 #msg{color:#9fd;font-size:12px;margin-left:4px}
+@media (max-width:760px){
+ header,.bar{position:static}                    /* both scroll away → full height for the hex view */
+ header{flex-wrap:wrap;gap:8px;padding:11px 13px}.sp{display:none}
+ header a{flex:0 0 auto}
+ .bar{gap:7px;padding:10px 13px}
+ .bar input,.bar select,.bar button,header a{font-size:16px}  /* comfy taps + no iOS zoom (hex byte cells kept small) */
+ #addr{width:auto;flex:1 1 120px}
+ .bar button,.bar select{flex:1 1 auto}
+ .hexwrap{max-height:none}                        /* page scrolls vertically; hex table scrolls sideways in its box */
+ #insp{position:static}
+ .warn{font-size:11.5px;padding:8px 12px}
+}
 </style></head><body>
 <header><b>Open OBI Energy Tracker · 🐞 Flash Debug</b><span class=lbl id=chip></span><span class=sp></span>
 <a href="/update">firmware ⬆</a><a href="/">← dashboard</a></header>
