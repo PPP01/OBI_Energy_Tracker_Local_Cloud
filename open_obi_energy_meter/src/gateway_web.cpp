@@ -89,6 +89,7 @@ static uint16_t g_mqttPort = 1883;
 static char     g_mqttUser[32] = "";
 static char     g_mqttPass[32] = "";
 static char     g_mqttTopic[48] = "obi/gateway";
+static char     g_tz[48] = "CET-1CEST,M3.5.0,M10.5.0/3";   // POSIX TZ for the history day-buckets (user-settable)
 static uint16_t g_pubEvery = 15;
 
 static uint32_t g_mqttLastPubMs = 0;
@@ -173,6 +174,9 @@ static String statusJson() {
   { float t = gwTempC(); j += ",\"temp_c\":" + (isnan(t) ? String("null") : String(t, 1)); }
   j += ",\"pair_remaining_s\":" + String(gw_pair_remaining_s());
   j += ",\"uptime_s\":" + String(gw_uptime_s());
+  { time_t tnow = time(nullptr); struct tm lt; localtime_r(&tnow, &lt); char tb[24];
+    strftime(tb, sizeof tb, "%Y-%m-%d %H:%M:%S", &lt);
+    j += ",\"tz\":" + jstr(g_tz) + ",\"time\":\"" + String(tb) + "\",\"time_valid\":" + String(tnow > 1735689600 ? "true" : "false"); }
   j += ",\"wifi\":" + String(g_wifiOk ? "true" : "false");
   j += ",\"ip\":\"" + (g_wifiOk ? WiFi.localIP().toString() : String("-")) + "\"";
   j += ",\"wifi_rssi\":" + String(g_wifiOk ? WiFi.RSSI() : 0);
@@ -510,6 +514,19 @@ static void handleMqttCfg() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Set the timezone (POSIX TZ string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3"). Persisted, applied IMMEDIATELY so the
+// history day-buckets re-align without a reboot; re-syncs NTP with the new zone if WiFi is up.
+static void handleTz() {
+  if (server.hasArg("tz") && server.arg("tz").length()) {
+    strlcpy(g_tz, server.arg("tz").c_str(), sizeof g_tz);
+    prefs.begin("obigw", false); prefs.putString("tz", g_tz); prefs.end();
+    setenv("TZ", g_tz, 1); tzset();
+    if (WiFi.status() == WL_CONNECTED) configTzTime(g_tz, "pool.ntp.org", "time.nist.gov");
+    Serial.printf("[tz] set %s\n", g_tz);
+  }
+  server.send(200, "application/json", String("{\"ok\":true,\"tz\":") + jstr(g_tz) + "}");
+}
+
 // ---- reader firmware OTA upload (multipart, .bin) --------------------------
 static bool s_otaOk = false;
 static void handleOtaUpload() {
@@ -792,6 +809,26 @@ button:disabled{opacity:.5;cursor:default}
  </div>
 
  <div class=card>
+  <h3>🕐 <span id=htime>Zeit</span></h3>
+  <div class=stat id=tzstat>…</div>
+  <label id=ltz>Zeitzone</label>
+  <select id=tzsel onchange=tzPick()>
+   <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europa – Berlin/Paris/Wien (CET/CEST)</option>
+   <option value="GMT0BST,M3.5.0/1,M10.5.0">UK – London (GMT/BST)</option>
+   <option value="WET0WEST,M3.5.0/1,M10.5.0">Portugal/Irland (WET/WEST)</option>
+   <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Osteuropa – Athen/Helsinki (EET/EEST)</option>
+   <option value="EST5EDT,M3.2.0,M11.1.0">USA – Eastern</option>
+   <option value="CST6CDT,M3.2.0,M11.1.0">USA – Central</option>
+   <option value="MST7MDT,M3.2.0,M11.1.0">USA – Mountain</option>
+   <option value="PST8PDT,M3.2.0,M11.1.0">USA – Pacific</option>
+   <option value="UTC0">UTC</option>
+   <option value="">— custom / POSIX —</option>
+  </select>
+  <label>POSIX TZ</label><input id=tztext placeholder="CET-1CEST,M3.5.0,M10.5.0/3">
+  <div class=row><button onclick=saveTz()><span id=btz>Speichern</span></button><span class=msg id=tzmsg></span></div>
+ </div>
+
+ <div class=card>
   <h3>⬆ Firmware</h3>
   <div class=stat id=fwcur>…</div>
   <div class=row style="margin-top:2px"><button class=g id=ghbtn onclick=ghCheck()>Auf Updates prüfen</button></div>
@@ -819,7 +856,8 @@ $('lhost').textContent=t('Server','Server');$('luser').textContent=t('Benutzer',
 $('ltopic').textContent=t('Basis-Topic','Base topic');$('bmsave').textContent=t('Speichern','Save');$('bdisc').textContent=t('Discovery senden','Send discovery');
 $('lman2').textContent=t('Manuell flashen (.bin dieses Boards)','Manual flash (.bin for this board)');$('bflash').textContent=t('Flashen & neustart','Flash & reboot');
 $('ghbtn').textContent=t('Auf Updates prüfen','Check for updates');
-let cfg=false;
+$('htime').textContent=t('Zeit','Time');$('ltz').textContent=t('Zeitzone','Timezone');$('btz').textContent=t('Speichern','Save');
+let cfg=false,tzc=false;
 async function load(){try{
   const s=await(await fetch('/api/status')).json();
   $('wfstat').innerHTML=s.wifi?`<span class="dot on"></span>${t('Verbunden','Connected')} · ${s.ip} · ${s.wifi_rssi} dBm`:`<span class="dot off"></span>${t('nicht verbunden','offline')}`;
@@ -827,7 +865,13 @@ async function load(){try{
   $('mqstat').innerHTML=!q.enabled?`<span class="dot idle"></span>${t('deaktiviert','disabled')}`:q.connected?`<span class="dot on"></span>${t('verbunden','connected')} · ${q.host}`:`<span class="dot off"></span>${t('getrennt','disconnected')} — ${q.state}`;
   if(!cfg){cfg=true;$('mh').value=q.host||'';$('mp').value=q.port||1883;$('mu').value=q.user||'';$('mt').value=q.topic||'';}
   $('fwcur').innerHTML=`${t('Aktuell','Current')}: <code>${s.fw?s.fw.version:'?'}</code> (${s.fw?s.fw.target:''})`;
+  $('tzstat').innerHTML=(s.time_valid?'<span class="dot on"></span>':'<span class="dot idle"></span>')+`${t('Gerätezeit','Device time')}: <code>${s.time||'?'}</code>`+(s.time_valid?'':` · ${t('noch nicht per NTP synchronisiert','not NTP-synced yet')}`);
+  if(!tzc){tzc=true;$('tztext').value=s.tz||'';$('tzsel').value=s.tz||'';if($('tzsel').value!==(s.tz||''))$('tzsel').value='';}
 }catch(e){}}
+function tzPick(){const v=$('tzsel').value;if(v)$('tztext').value=v;}
+async function saveTz(){const z=$('tztext').value.trim();if(!z){$('tzmsg').textContent=t('TZ eingeben','enter a TZ');return;}
+ $('tzmsg').textContent='…';try{await fetch('/api/tz',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'tz='+encodeURIComponent(z)});}catch(e){}
+ $('tzmsg').textContent=t('gespeichert ✓','saved ✓');setTimeout(()=>$('tzmsg').textContent='',3000);load();}
 async function scan(){$('wfmsg').textContent=t('suche…','scanning…');$('bscan').disabled=true;
  try{let n=await(await fetch('/api/wifi/scan')).json();n.sort((a,b)=>b.rssi-a.rssi);let seen={},o=`<option value="">${t('— Netzwerk wählen —','— pick a network —')}</option>`;
   for(let x of n){if(!x.ssid||seen[x.ssid])continue;seen[x.ssid]=1;o+=`<option>${x.ssid} (${x.rssi} dBm)${x.enc?' 🔒':''}</option>`;}
@@ -874,7 +918,7 @@ function upload(){let f=$('file').files[0];if(!f){$('upmsg').textContent=t('erst
  x.onload=()=>{let ok=false;try{ok=JSON.parse(x.responseText).ok;}catch(e){}$('fill').style.width='100%';$('upmsg').textContent=ok?t('geschrieben — Neustart…','written — rebooting…'):t('Update fehlgeschlagen (Image abgelehnt).','update failed (image rejected).');if(ok)setTimeout(()=>location.href='/',9000);else $('upbtn').disabled=false;};
  x.onerror=()=>{$('upmsg').textContent=t('Verbindung verloren (evtl. Neustart)','connection lost (maybe rebooting)');setTimeout(()=>location.href='/',9000);};
  x.send(fd);}
-load();ghCheck();
+load();ghCheck();setInterval(load,5000);   // keep WiFi/MQTT status + the device clock fresh
 </script></body></html>)HTML";
 static void handleSettingsPage() {
   server.send_P(200, "text/html", SETTINGS_HTML);
@@ -1650,6 +1694,7 @@ static void startServices() {
   server.on("/api/status", handleStatus);
   server.on("/api/interval", HTTP_POST, handleInterval);
   server.on("/api/mqtt", HTTP_POST, handleMqttCfg);
+  server.on("/api/tz",   HTTP_POST, handleTz);       // set the timezone (history day-buckets)
   server.on("/api/wifi", HTTP_POST, handleWifiPortal);        // open the on-demand WiFiManager portal (AP)
   server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);      // list nearby networks (dashboard panel)
   server.on("/api/wifi/connect", HTTP_POST, handleWifiConnect); // connect to a chosen network in-place
@@ -2115,8 +2160,10 @@ static void webTask(void *) {
   prefs.getString("u", "").toCharArray(g_mqttUser, sizeof g_mqttUser);
   prefs.getString("pw", "").toCharArray(g_mqttPass, sizeof g_mqttPass);
   { String t = prefs.getString("t", "obi/gateway"); t.toCharArray(g_mqttTopic, sizeof g_mqttTopic); }
+  { String z = prefs.getString("tz", "CET-1CEST,M3.5.0,M10.5.0/3"); z.toCharArray(g_tz, sizeof g_tz); }
   g_priceCent = prefs.getFloat("pkwh", 31.0f);   // electricity price (€ ct/kWh) for the history cost columns
   prefs.end();
+  setenv("TZ", g_tz, 1); tzset();                // apply the saved zone up-front (localtime works before NTP too)
 
   static char portBuf[8]; snprintf(portBuf, sizeof portBuf, "%u", g_mqttPort);
   pHost  = new WiFiManagerParameter("host", "MQTT host (blank = off)", g_mqttHost, sizeof g_mqttHost - 1);
@@ -2155,7 +2202,7 @@ static void webTask(void *) {
       if (conn) {
         if (g_apActive) { WiFi.softAPdisconnect(true); g_apActive = false; }
         mqtt.setServer(g_mqttHost, g_mqttPort);
-        configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");  // wall clock for history day-buckets
+        configTzTime(g_tz, "pool.ntp.org", "time.nist.gov");  // wall clock for history day-buckets (user-set zone)
         Serial.printf("[web] connected: http://%s/\n", WiFi.localIP().toString().c_str());
       } else if (!g_apActive) {
         WiFi.mode(WIFI_AP_STA); WiFi.softAP(apSsid()); g_apActive = true;
