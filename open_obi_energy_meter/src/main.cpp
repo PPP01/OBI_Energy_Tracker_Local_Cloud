@@ -801,11 +801,8 @@ static inline bool buttonPressed() {
 }
 
 static void doFactoryReset() {
-  Serial.println("\n[btn] factory reset — wiping WiFi + MQTT + reader list + assignments");
-  g_uuidStore.begin("obiuuid", false); g_uuidStore.clear(); g_uuidStore.end();      // stored reader UUIDs
-  { Preferences p; p.begin("obiassign", false); p.clear(); p.end(); }                       // reader assignments
-  { Preferences p; p.begin("obiival", false); p.clear(); p.end(); }                         // persisted upload intervals
-  web_factory_reset();                                                          // WiFi + MQTT settings
+  Serial.println("\n[btn] factory reset — wiping WiFi + MQTT + reader list + assignments + history");
+  web_factory_reset();                             // WiFi + MQTT + login + reader UUIDs/bindings/intervals + history
   for (int i = 0; i < 20; i++) { led_write(i & 1); delay(100); }                // ~2 s blink = confirmed
   Serial.println("[btn] done — rebooting into setup portal");
   delay(200);

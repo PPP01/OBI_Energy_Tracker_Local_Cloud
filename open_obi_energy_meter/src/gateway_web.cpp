@@ -12,6 +12,7 @@
 #include <WiFiClientSecure.h>     // HTTPS to api.github.com / release asset host
 #include <esp_partition.h>        // partition list for the /debug hex editor
 #include <esp_mac.h>              // base MAC for the per-device setup-AP name
+#include <esp_random.h>           // esp_random() for login session tokens
 #include <soc/soc_caps.h>         // SOC_TEMP_SENSOR_SUPPORTED (internal temperature sensor)
 #include <PubSubClient.h>         // knolleary/PubSubClient
 #include <Preferences.h>
@@ -43,8 +44,9 @@ static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT>
 static bool g_epdOk = false;
 #endif
 
-static WebServer    server(80);
-static WiFiClient    net;
+static WebServer      server(80);
+static WiFiClient       net;         // plain MQTT (port 1883)
+static WiFiClientSecure netTls;      // MQTTS (TLS) — used when g_mqttTls; ESP32 does the TLS, no HTTPS on the web side
 static PubSubClient  mqtt(net);
 static Preferences   prefs;
 static WiFiManager   wm;
@@ -89,12 +91,34 @@ static uint16_t g_mqttPort = 1883;
 static char     g_mqttUser[32] = "";
 static char     g_mqttPass[32] = "";
 static char     g_mqttTopic[48] = "obi/gateway";
+static bool     g_mqttTls = false;   // MQTTS: wrap the MQTT socket in TLS (WiFiClientSecure). Broker side only.
+static String   g_mqttCa;            // optional PEM CA cert to verify the broker; empty = encrypt-only (setInsecure)
 static char     g_tz[48] = "CET-1CEST,M3.5.0,M10.5.0/3";   // POSIX TZ for the history day-buckets (user-settable)
 static uint16_t g_pubEvery = 15;
+
+// HTTP Basic Auth for the whole web dashboard/API. Blank username = auth disabled (open, backward compatible).
+// The ESP32 does NOT serve HTTPS — auth guards access on a plain-HTTP LAN; use MQTTS for the broker link.
+static char     g_authUser[32] = "";
+static char     g_authPass[64] = "";
+
+// Point PubSubClient at the plain or TLS socket per g_mqttTls, then (re)set the broker address.
+// With a CA cert we verify the broker; without one we only encrypt (setInsecure) — fine for a self-signed
+// broker on the LAN (e.g. the project's own mqtts_server.py). Call after any host/port/TLS change.
+static void applyMqttClient() {
+  if (g_mqttTls) {
+    if (g_mqttCa.length()) netTls.setCACert(g_mqttCa.c_str());
+    else                   netTls.setInsecure();     // encrypt only, don't validate the cert chain
+    mqtt.setClient(netTls);
+  } else {
+    mqtt.setClient(net);
+  }
+  mqtt.setServer(g_mqttHost, g_mqttPort);
+}
 
 static uint32_t g_mqttLastPubMs = 0;
 static uint32_t g_mqttPubCount  = 0;
 static int      g_mqttState     = -1;
+static bool     g_mqttReconnect = false;   // set after a config change -> mqttService reconnects at once (skip the 8 s backoff)
 
 // ---------------------------------------------------------------- helpers
 static String hex(const uint8_t *p, size_t n, const char *sep = "") {
@@ -184,11 +208,14 @@ static String statusJson() {
   j += ",\"freq_mhz\":869.5,\"bw_khz\":500,\"sf\":7";
   j += ",\"mqtt\":{\"host\":" + jstr(g_mqttHost) + ",\"port\":" + String(g_mqttPort);
   j += ",\"user\":" + jstr(g_mqttUser) + ",\"topic\":" + jstr(g_mqttTopic);
+  j += ",\"tls\":" + String(g_mqttTls ? "true" : "false");
+  j += ",\"ca_set\":" + String(g_mqttCa.length() ? "true" : "false");
   j += ",\"enabled\":" + String(g_mqttHost[0] ? "true" : "false");
   j += ",\"connected\":" + String(con ? "true" : "false");
   j += ",\"state\":" + jstr(mqttStateText(g_mqttState));
   j += ",\"pub_count\":" + String(g_mqttPubCount);
   j += ",\"last_pub_s\":" + String(lastPub) + "}";
+  j += ",\"auth\":{\"enabled\":" + String(g_authUser[0] ? "true" : "false") + ",\"user\":" + jstr(g_authUser) + "}";
   // reader OTA status
   uint8_t ot[3] = {0}; gw_ota_target(ot);
   j += ",\"ota\":{\"active\":" + String(gw_ota_active() ? "true" : "false");
@@ -316,7 +343,8 @@ footer b{font-family:var(--mono);color:var(--txt)}
 <button class="icon" onclick="location.href='/history'" title="Energie-Historie &amp; Tagesverbrauch pro Reader">📈 History</button>
 <button class="icon" onclick="location.href='/radio'" title="Live LoRa radio messages">📡 Radio</button>
 <button class="icon" onclick="location.href='/debug'" title="Flash hex editor / eFuses / debug">🐞 Debug</button>
-<button class="icon" onclick="rebootGw()" title="Restart the gateway">⟳ Reboot</button></div>
+<button class="icon" onclick="rebootGw()" title="Restart the gateway">⟳ Reboot</button>
+<button class="icon" id="logout_btn" style="display:none" onclick="doLogout()" title="Log out">⎋ Logout</button></div>
 <div class="bar" id="bar"></div>
 </header>
 <div class="wrap">
@@ -326,6 +354,7 @@ footer b{font-family:var(--mono);color:var(--txt)}
 </div>
 <script>
 const $=s=>document.querySelector(s);
+const _f=window.fetch;window.fetch=(...a)=>_f(...a).then(r=>{if(r.status==401)location.href='/login';return r;});  // session lost -> login
 const T={
  de:{sub:'869,5 MHz · SF7 · liest deine Zähler direkt',wifi:'WLAN',mqtt:'MQTT',radio:'Funk',readers:'Reader',
   offline:'offline',fw:'Firmware',batt:'Batterie',opt:'Sensor',active:'aktiv',nosig:'kein Signal',
@@ -376,6 +405,7 @@ function applyLang(){$('#lde').className=lang=='de'?'act':'';$('#len').className
 function rebootGw(){if(!confirm(lang=='de'?'Gateway jetzt neu starten?':'Restart the gateway now?'))return;
  fetch('/api/reboot',{method:'POST'}).catch(()=>{});
  alert(lang=='de'?'Neustart läuft… in ~10 s wieder erreichbar.':'Restarting… back in ~10 s.');}
+async function doLogout(){await fetch('/api/logout',{method:'POST'}).catch(()=>{});location.href='/login';}
 async function scanWifi(){$('#wf_msg').textContent=lang=='de'?'suche…':'scanning…';$('#wf_scanb').disabled=true;
  try{let n=await(await fetch('/api/wifi/scan')).json();n.sort((a,b)=>b.rssi-a.rssi);
   let seen={},opts='<option value="">'+(lang=='de'?'— Netzwerk wählen —':'— pick a network —')+'</option>';
@@ -402,6 +432,7 @@ function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.fl
 let cfgLoaded=false;
 async function tick(){try{
  const st=await (await fetch('/api/status')).json(), rs=await (await fetch('/api/readers')).json();
+ $('#logout_btn').style.display=(st.auth&&st.auth.enabled)?'':'none';   // only show logout when a login is required
  $('#sub').textContent='OBI Gateway '+(st.gw||st.gwid).toUpperCase();
  $('#gw').textContent=st.gwid_ascii+' · '+(st.mac||st.gwid);
  $('#ft').textContent=L.uptime+' '+fmt(st.uptime_s)+(st.fw?' · fw '+st.fw.version+' ('+st.fw.target+')':'');
@@ -486,6 +517,113 @@ applyLang();tick();setInterval(tick,2000);
 </script></body></html>
 )HTML";
 
+// ---------------------------------------------------------------- login session (form, not the Basic-Auth popup)
+// We use a session cookie + our own /login page instead of HTTP Basic Auth, so the browser shows a proper
+// login window rather than the native credential popup. Tokens live in RAM (cleared on reboot -> re-login).
+#define OBI_SESS_MAX 4
+static String g_sess[OBI_SESS_MAX];        // active session tokens (empty = free slot)
+
+// Mint a random 64-bit hex token, store it in the next slot (rotating), and return it.
+static String newSession() {
+  char buf[17];
+  snprintf(buf, sizeof buf, "%08x%08x", (unsigned)esp_random(), (unsigned)esp_random());
+  static int next = 0;
+  g_sess[next] = buf; next = (next + 1) % OBI_SESS_MAX;
+  return String(buf);
+}
+// Pull the obi_sess token out of the request's Cookie header (empty if none).
+static String reqSession() {
+  String c = server.header("Cookie");
+  int i = c.indexOf("obi_sess=");
+  if (i < 0) return "";
+  i += 9; int j = i;
+  while (j < (int)c.length() && c[j] != ';' && c[j] != ' ') j++;
+  return c.substring(i, j);
+}
+// authValid(): may this request proceed? (auth off, or a valid session cookie). Sends nothing.
+static bool authValid() {
+  if (!g_authUser[0]) return true;                 // no username configured -> open
+  String tok = reqSession();
+  if (tok.length() < 8) return false;
+  for (int i = 0; i < OBI_SESS_MAX; i++) if (g_sess[i].length() && g_sess[i] == tok) return true;
+  return false;
+}
+// authGuard(): allow, or send the caller to the login page. Pages get a 302 redirect to /login; API/XHR
+// calls get a plain 401 (NO WWW-Authenticate header, so the browser never pops its native login box).
+static bool authGuard() {
+  if (authValid()) return true;
+  if (server.method() == HTTP_GET && !server.uri().startsWith("/api")) {
+    server.sendHeader("Location", "/login");
+    server.send(302, "text/plain", "");
+  } else {
+    server.send(401, "application/json", "{\"ok\":false,\"error\":\"auth\"}");
+  }
+  return false;
+}
+// Wrap a route handler so it only runs once the request is authenticated.
+static WebServer::THandlerFunction guard(WebServer::THandlerFunction h) {
+  return [h]() { if (authGuard()) h(); };
+}
+
+// ---- /login page + /api/login + /api/logout (all UNguarded) --------------------------------------------
+static const char LOGIN_HTML[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1'><title>Open OBI Energy Tracker — Login</title><style>
+:root{--bg:#0a0e14;--panel:#141a23;--panel2:#1b2430;--line:#232e3c;--txt:#eaf0f7;--dim:#7d8da0;--accent:#31d07a;--accent2:#12a35a;--red:#f0616d}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:
+ radial-gradient(1000px 460px at 80% -10%,#12351f33,transparent),radial-gradient(800px 380px at -10% 0%,#0e2a4a33,transparent),var(--bg);
+ color:var(--txt);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.box{width:min(92vw,360px);background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px 24px}
+.logo{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:23px;margin:0 auto 14px;
+ background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 20px #31d07a55}
+h1{font-size:17px;margin:0 0 3px;text-align:center}.sub{color:var(--dim);font-size:12.5px;text-align:center;margin-bottom:20px}
+label{display:block;font-size:12px;color:var(--dim);margin:12px 0 5px}
+input{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:9px;padding:11px 12px;font-size:16px}
+button{width:100%;margin-top:18px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04140a;border:0;border-radius:9px;padding:12px;font-weight:700;font-size:15px;cursor:pointer}
+.err{color:var(--red);font-size:13px;min-height:18px;margin-top:12px;text-align:center}
+</style></head><body>
+<form class=box id=lf>
+ <div class=logo>⚡</div>
+ <h1>Open OBI Energy Tracker</h1><div class=sub>Please sign in</div>
+ <label>User</label><input id=u autocomplete=username autofocus>
+ <label>Password</label><input id=p type=password autocomplete=current-password>
+ <button type=submit>Sign in</button>
+ <div class=err id=err></div>
+</form>
+<script>
+const $=i=>document.getElementById(i);
+// Bind via addEventListener (NOT inline onsubmit) so the handler can't be shadowed by a form control id.
+document.getElementById('lf').addEventListener('submit',async e=>{
+ e.preventDefault();const err=$('err'),btn=e.submitter||$('lf').querySelector('button');
+ err.textContent='';if(btn)btn.disabled=true;
+ try{const r=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},
+   body:'user='+encodeURIComponent($('u').value)+'&pass='+encodeURIComponent($('p').value)});
+  if(r.ok){location.href='/';return;}
+  err.textContent='Wrong user or password';}
+ catch(x){err.textContent='Connection error';}
+ if(btn)btn.disabled=false;});
+</script></body></html>)HTML";
+
+static void handleLoginPage() {
+  if (authValid()) { server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); return; }  // already in
+  server.send_P(200, "text/html", LOGIN_HTML);
+}
+static void handleLogin() {
+  String u = server.arg("user"), p = server.arg("pass");
+  if (!g_authUser[0]) { server.send(200, "application/json", "{\"ok\":true}"); return; }  // auth disabled -> always ok
+  if (u == g_authUser && p == g_authPass) {
+    server.sendHeader("Set-Cookie", "obi_sess=" + newSession() + "; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax");
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(401, "application/json", "{\"ok\":false}");
+  }
+}
+static void handleLogout() {
+  String tok = reqSession();
+  for (int i = 0; i < OBI_SESS_MAX; i++) if (g_sess[i] == tok) g_sess[i] = "";   // invalidate this session
+  server.sendHeader("Set-Cookie", "obi_sess=; Path=/; Max-Age=0");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // ---------------------------------------------------------------- routes
 static void handleReaders() { server.send(200, "application/json", readersJson()); }
 static void handleStatus()  { server.send(200, "application/json", statusJson()); }
@@ -507,11 +645,30 @@ static void handleMqttCfg() {
   if (server.hasArg("user")) strlcpy(g_mqttUser, server.arg("user").c_str(), sizeof g_mqttUser);
   if (server.hasArg("pass")) strlcpy(g_mqttPass, server.arg("pass").c_str(), sizeof g_mqttPass);
   if (server.hasArg("topic")) strlcpy(g_mqttTopic, server.arg("topic").c_str(), sizeof g_mqttTopic);
+  if (server.hasArg("tls")) g_mqttTls = server.arg("tls") == "1" || server.arg("tls") == "true";
+  if (server.hasArg("ca"))  g_mqttCa  = server.arg("ca");   // PEM CA (blank = encrypt-only / insecure)
   prefs.begin("obigw", false);
   prefs.putString("h", g_mqttHost); prefs.putUShort("p", g_mqttPort);
   prefs.putString("u", g_mqttUser); prefs.putString("pw", g_mqttPass); prefs.putString("t", g_mqttTopic);
+  prefs.putBool("tls", g_mqttTls); prefs.putString("ca", g_mqttCa);
   prefs.end();
-  mqtt.disconnect(); mqtt.setServer(g_mqttHost, g_mqttPort);
+  mqtt.disconnect(); applyMqttClient();
+  g_mqttReconnect = true;          // try to (re)connect immediately, don't wait out the retry backoff
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ---- /api/auth — set the HTTP Basic Auth username/password for the web dashboard --------------------
+// Blank username disables auth (open access). Password is only overwritten when a non-empty one is posted,
+// so the UI can change the username without forcing the password to be re-typed.
+static void handleAuthCfg() {
+  if (server.hasArg("user")) strlcpy(g_authUser, server.arg("user").c_str(), sizeof g_authUser);
+  if (server.hasArg("pass") && server.arg("pass").length())
+    strlcpy(g_authPass, server.arg("pass").c_str(), sizeof g_authPass);
+  if (!g_authUser[0]) g_authPass[0] = 0;                    // no user -> clear the password too
+  for (int i = 0; i < OBI_SESS_MAX; i++) g_sess[i] = "";    // credential change -> invalidate all sessions
+  prefs.begin("obigw", false);
+  prefs.putString("au", g_authUser); prefs.putString("ap", g_authPass);
+  prefs.end();
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -533,6 +690,7 @@ static bool s_otaOk = false;
 static void handleOtaUpload() {
   HTTPUpload &up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
+    if (!authValid()) { s_otaOk = false; return; }         // reject the stream; the done-handler guard sends 401
     String id = server.arg("id");
     uint32_t size = server.arg("size").toInt();
     uint8_t ver = (uint8_t)server.arg("ver").toInt();
@@ -563,6 +721,7 @@ static bool s_selfOtaOk = false;
 static void handleSelfOtaUpload() {
   HTTPUpload &up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
+    if (!authValid()) { s_selfOtaOk = false; return; }      // reject the stream; the done-handler guard sends 401
     s_selfOtaOk = Update.begin(UPDATE_SIZE_UNKNOWN);        // grow into the whole free OTA partition
     if (!s_selfOtaOk) Update.printError(Serial);
     Serial.printf("[selfota] start: %s\n", up.filename.c_str());
@@ -804,9 +963,25 @@ button:disabled{opacity:.5;cursor:default}
    <div><label id=lpass>Passwort</label><input id=mpw type=password placeholder=••••></div>
   </div>
   <label id=ltopic>Basis-Topic</label><input id=mt placeholder=obi/gateway>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+   <input type=checkbox id=mtls style="width:auto;margin:0"><span id=ltls>MQTTS (TLS-Verschlüsselung)</span></label>
+  <label id=lca>CA-Zertifikat (PEM, optional)</label>
+  <textarea id=mca rows=3 placeholder="-----BEGIN CERTIFICATE-----" style="width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px 10px;font-family:var(--mono);font-size:12px"></textarea>
   <div class=row><button onclick=saveMqtt()><span id=bmsave>Speichern</span></button>
    <button class=g onclick=disc()><span id=bdisc>Discovery senden</span></button>
    <span class=msg id=mqmsg></span></div>
+ </div>
+
+ <div class=card>
+  <h3>🔒 <span id=hauth>Web-Zugang</span></h3>
+  <div class=stat id=austat>…</div>
+  <div class=grid>
+   <div><label id=lauser>Benutzer (leer = offen)</label><input id=au autocomplete=username></div>
+   <div><label id=lapass>Passwort</label><input id=ap type=password autocomplete=new-password placeholder=••••></div>
+  </div>
+  <div class=row><button onclick=saveAuth()><span id=basave>Speichern</span></button>
+   <button class=g onclick=logout()><span id=blogout>Abmelden</span></button>
+   <span class=msg id=aumsg></span></div>
  </div>
 
  <div class=card>
@@ -840,11 +1015,16 @@ button:disabled{opacity:.5;cursor:default}
   <div class=bar id=bar><div class=fill id=fill></div></div>
   <div class=msg id=upmsg></div>
   <div class=row><button id=upbtn onclick=upload()><span id=bflash>Flashen &amp; neustart</span></button></div>
+  <hr>
+  <label id=lfr>Werkseinstellungen</label>
+  <div class=msg id=frnote style="margin:2px 0 8px">Löscht WLAN, MQTT und Login-Daten, dann Neustart ins Setup-Portal.</div>
+  <div class=row><button class=g id=frbtn onclick=factoryReset() style="border-color:var(--red);color:var(--red)"><span id=bfr>Auf Werkseinstellungen zurücksetzen</span></button><span class=msg id=frmsg></span></div>
  </div>
 
 </div>
 <script>
 const $=i=>document.getElementById(i);
+const _f=window.fetch;window.fetch=(...a)=>_f(...a).then(r=>{if(r.status==401)location.href='/login';return r;});  // session lost -> login
 const de=(localStorage.getItem('lang')||'de')=='de';
 const t=(d,e)=>de?d:e;
 function setL(x){localStorage.setItem('lang',x);location.reload();}   // switch language + re-render
@@ -855,7 +1035,11 @@ $('lman').textContent=t('…oder SSID eingeben','…or type SSID');$('lwpass').t
 $('bconn').textContent=t('Verbinden & speichern','Connect & save');$('bportal').textContent=t('Setup-Portal (AP)','Setup portal (AP)');
 $('lhost').textContent=t('Server','Server');$('luser').textContent=t('Benutzer','User');$('lpass').textContent=t('Passwort','Password');
 $('ltopic').textContent=t('Basis-Topic','Base topic');$('bmsave').textContent=t('Speichern','Save');$('bdisc').textContent=t('Discovery senden','Send discovery');
+$('ltls').textContent=t('MQTTS (TLS-Verschlüsselung)','MQTTS (TLS encryption)');$('lca').textContent=t('CA-Zertifikat (PEM, optional)','CA certificate (PEM, optional)');
+$('hauth').textContent=t('Web-Zugang','Web access');$('lauser').textContent=t('Benutzer (leer = offen)','User (blank = open)');$('lapass').textContent=t('Passwort','Password');$('basave').textContent=t('Speichern','Save');$('blogout').textContent=t('Abmelden','Log out');
 $('lman2').textContent=t('Manuell flashen (.bin dieses Boards)','Manual flash (.bin for this board)');$('bflash').textContent=t('Flashen & neustart','Flash & reboot');
+$('lfr').textContent=t('Werkseinstellungen','Factory reset');$('bfr').textContent=t('Auf Werkseinstellungen zurücksetzen','Reset to factory settings');
+$('frnote').textContent=t('Löscht WLAN, MQTT, Login, gebundene Reader und den Verlauf — dann Neustart ins Setup-Portal.','Erases WiFi, MQTT, login, bound readers and history — then reboots into the setup portal.');
 $('ghbtn').textContent=t('Auf Updates prüfen','Check for updates');
 $('htime').textContent=t('Zeit','Time');$('ltz').textContent=t('Zeitzone','Timezone');$('btz').textContent=t('Speichern','Save');
 let cfg=false,tzc=false;
@@ -863,8 +1047,12 @@ async function load(){try{
   const s=await(await fetch('/api/status')).json();
   $('wfstat').innerHTML=s.wifi?`<span class="dot on"></span>${t('Verbunden','Connected')} · ${s.ip} · ${s.wifi_rssi} dBm`:`<span class="dot off"></span>${t('nicht verbunden','offline')}`;
   const q=s.mqtt;
-  $('mqstat').innerHTML=!q.enabled?`<span class="dot idle"></span>${t('deaktiviert','disabled')}`:q.connected?`<span class="dot on"></span>${t('verbunden','connected')} · ${q.host}`:`<span class="dot off"></span>${t('getrennt','disconnected')} — ${q.state}`;
-  if(!cfg){cfg=true;$('mh').value=q.host||'';$('mp').value=q.port||1883;$('mu').value=q.user||'';$('mt').value=q.topic||'';}
+  const tls=q.tls?' · 🔒TLS':'';
+  $('mqstat').innerHTML=!q.enabled?`<span class="dot idle"></span>${t('deaktiviert','disabled')}`:q.connected?`<span class="dot on"></span>${t('verbunden','connected')} · ${q.host}${tls}`:`<span class="dot off"></span>${t('getrennt','disconnected')} — ${q.state}${tls}`;
+  if(!cfg){cfg=true;$('mh').value=q.host||'';$('mp').value=q.port||1883;$('mu').value=q.user||'';$('mt').value=q.topic||'';
+   $('mtls').checked=!!q.tls;if(q.ca_set)$('mca').placeholder=t('Zertifikat gespeichert — leer lassen zum Beibehalten','certificate saved — leave blank to keep');
+   $('au').value=(s.auth&&s.auth.user)||'';}
+  $('austat').innerHTML=(s.auth&&s.auth.enabled)?`<span class="dot on"></span>${t('geschützt als','protected as')} <code>${s.auth.user}</code>`:`<span class="dot idle"></span>${t('offen — kein Passwort','open — no password')}`;
   $('fwcur').innerHTML=`${t('Aktuell','Current')}: <code>${s.fw?s.fw.version:'?'}</code> (${s.fw?s.fw.target:''})`;
   $('tzstat').innerHTML=(s.time_valid?'<span class="dot on"></span>':'<span class="dot idle"></span>')+`${t('Gerätezeit','Device time')}: <code>${s.time||'?'}</code>`+(s.time_valid?'':` · ${t('noch nicht per NTP synchronisiert','not NTP-synced yet')}`);
   if(!tzc){tzc=true;$('tztext').value=s.tz||'';$('tzsel').value=s.tz||'';if($('tzsel').value!==(s.tz||''))$('tzsel').value='';}
@@ -887,7 +1075,13 @@ async function connect(){let s=$('man').value.trim()||$('ssid').value.replace(/ 
  $('wfmsg').textContent=t('verbinde… ändert sich die IP, öffne das Dashboard unter der neuen IP.','connecting… if the IP changes, reopen at the new IP.');}
 function portal(){fetch('/api/wifi',{method:'POST'}).then(r=>r.json()).then(d=>{alert((de?'Portal gestartet auf WLAN: ':'Portal on WiFi: ')+d.ssid+'\nhttp://192.168.4.1/');}).catch(()=>{});}
 async function saveMqtt(){const b=new URLSearchParams();b.set('host',$('mh').value);b.set('port',$('mp').value||1883);b.set('user',$('mu').value);b.set('topic',$('mt').value);if($('mpw').value)b.set('pass',$('mpw').value);
+ b.set('tls',$('mtls').checked?'1':'0');if($('mca').value.trim())b.set('ca',$('mca').value.trim());  // blank CA = keep existing / encrypt-only
  $('mqmsg').textContent='…';await fetch('/api/mqtt',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:b});$('mpw').value='';$('mqmsg').textContent=t('gespeichert ✓','saved ✓');setTimeout(()=>$('mqmsg').textContent='',3000);load();}
+async function saveAuth(){const u=$('au').value.trim();const b=new URLSearchParams();b.set('user',u);if($('ap').value)b.set('pass',$('ap').value);
+ $('aumsg').textContent='…';await fetch('/api/auth',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:b});$('ap').value='';
+ if(u){location.href='/login';return;}   // auth on -> (re)login with the new credentials
+ $('aumsg').textContent=t('gespeichert ✓','saved ✓');setTimeout(()=>$('aumsg').textContent='',4000);load();}
+async function logout(){await fetch('/api/logout',{method:'POST'});location.href='/login';}
 async function disc(){$('mqmsg').textContent='…';try{const r=await(await fetch('/api/rediscover',{method:'POST'})).json();$('mqmsg').textContent=r.ok?t('Discovery gesendet ✓','discovery sent ✓')+' ('+r.count+')':t('MQTT nicht verbunden','MQTT not connected');}catch(e){$('mqmsg').textContent='error';}setTimeout(()=>$('mqmsg').textContent='',4000);}
 async function ghCheck(){const box=$('ghbox');box.className='msg';box.textContent=t('GitHub wird geprüft…','checking GitHub…');
  try{const r=await(await fetch('/api/github/latest')).json();
@@ -919,6 +1113,11 @@ function upload(){let f=$('file').files[0];if(!f){$('upmsg').textContent=t('erst
  x.onload=()=>{let ok=false;try{ok=JSON.parse(x.responseText).ok;}catch(e){}$('fill').style.width='100%';$('upmsg').textContent=ok?t('geschrieben — Neustart…','written — rebooting…'):t('Update fehlgeschlagen (Image abgelehnt).','update failed (image rejected).');if(ok)setTimeout(()=>location.href='/',9000);else $('upbtn').disabled=false;};
  x.onerror=()=>{$('upmsg').textContent=t('Verbindung verloren (evtl. Neustart)','connection lost (maybe rebooting)');setTimeout(()=>location.href='/',9000);};
  x.send(fd);}
+async function factoryReset(){
+ if(!confirm(t('Wirklich auf Werkseinstellungen zurücksetzen?\n\nWLAN, MQTT, Login, alle gebundenen Reader und der komplette Verlauf werden gelöscht. Das Gerät startet danach im Setup-Portal (WLAN „OpenOBI-…", http://192.168.4.1/).','Really reset to factory settings?\n\nWiFi, MQTT, login, all bound readers and the entire history will be erased. The device then boots into the setup portal (WiFi "OpenOBI-…", http://192.168.4.1/).')))return;
+ $('frbtn').disabled=true;$('frmsg').textContent=t('setze zurück…','resetting…');
+ try{await fetch('/api/factory_reset',{method:'POST'});}catch(e){}
+ $('frmsg').textContent=t('zurückgesetzt — Neustart ins Setup-Portal…','reset — rebooting into setup portal…');}
 load();ghCheck();setInterval(load,5000);   // keep WiFi/MQTT status + the device clock fresh
 </script></body></html>)HTML";
 static void handleSettingsPage() {
@@ -981,6 +1180,16 @@ static void handleEfuse() { server.send(200, "application/json", flash_dbg_efuse
 static void handleReboot() {   // answer first, then restart
   server.send(200, "application/json", "{\"ok\":true}");
   Serial.println("[web] reboot requested from dashboard");
+  delay(200);
+  ESP.restart();
+}
+// Wipe WiFi + MQTT + all settings (incl. web login), then reboot into the setup captive portal.
+// Same effect as the ~5 s case-button hold, but reachable from the Settings firmware area.
+static void handleFactoryReset() {
+  server.send(200, "application/json", "{\"ok\":true}");
+  Serial.println("[web] factory reset requested from dashboard");
+  delay(200);
+  web_factory_reset();
   delay(200);
   ESP.restart();
 }
@@ -1692,44 +1901,54 @@ static void startServices() {
   static bool routesReg = false;
   if (!routesReg) {   // register routes once — startServices() may run again after the WiFi portal closes
   routesReg = true;
-  server.on("/", handleIndex);
-  server.on("/api/readers", handleReaders);
-  server.on("/api/status", handleStatus);
-  server.on("/api/interval", HTTP_POST, handleInterval);
-  server.on("/api/mqtt", HTTP_POST, handleMqttCfg);
-  server.on("/api/tz",   HTTP_POST, handleTz);       // set the timezone (history day-buckets)
-  server.on("/api/wifi", HTTP_POST, handleWifiPortal);        // open the on-demand WiFiManager portal (AP)
-  server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);      // list nearby networks (dashboard panel)
-  server.on("/api/wifi/connect", HTTP_POST, handleWifiConnect); // connect to a chosen network in-place
-  server.on("/api/rediscover", HTTP_POST, handleRediscover);
-  server.on("/api/delete", HTTP_POST, handleDelete);
-  server.on("/api/ota", HTTP_POST, handleOtaDone, handleOtaUpload);   // reader firmware over LoRa
-  server.on("/api/ota_cancel", HTTP_POST, handleOtaCancel);
-  server.on("/settings",        HTTP_GET,  handleSettingsPage);       // WiFi + MQTT + firmware in one page
-  server.on("/api/github/latest", HTTP_GET,  handleGithubLatest);     // check GitHub for the newest release
-  server.on("/api/github/update", HTTP_POST, handleGithubUpdate);     // pull + flash the newest release .bin
-  server.on("/api/github/progress", HTTP_GET, handleGithubProgress);  // live download/flash % for the UI
-  server.on("/update", HTTP_GET, handleUpdatePage);                   // ESP32 self-update page (still linked from /settings)
-  server.on("/api/selfupdate", HTTP_POST, handleSelfOtaDone, handleSelfOtaUpload);
-  server.on("/debug", HTTP_GET, handleDebugPage);                     // flash hex editor
-  server.on("/api/flash/info",  HTTP_GET,  handleFlashInfo);
-  server.on("/api/flash/read",  HTTP_GET,  handleFlashRead);
-  server.on("/api/flash/patch", HTTP_POST, handleFlashPatch);
-  server.on("/api/flash/erase", HTTP_POST, handleFlashErase);
-  server.on("/api/efuse",       HTTP_GET,  handleEfuse);
-  server.on("/api/reboot",      HTTP_POST, handleReboot);   // restart the gateway from the dashboard
-  server.on("/api/assign",      HTTP_POST, handleAssign);   // accept/drop a reader onto this gateway
-  server.on("/api/pairall",     HTTP_POST, handlePairAll);  // open the 3-min auto-accept window
-  server.on("/radio",           HTTP_GET,  handleRadioPage);  // live radio message view
-  server.on("/api/radio",       HTTP_GET,  handleRadioApi);
-  server.on("/history",         HTTP_GET,  handleHistoryPage); // per-reader energy history + charts
-  server.on("/api/history",     HTTP_GET,  handleHistoryApi);
-  server.on("/api/history/clear", HTTP_POST, handleHistoryClear);
-  server.on("/api/price",       HTTP_GET,  handlePrice);        // read the € ct/kWh price
-  server.on("/api/price",       HTTP_POST, handlePrice);        // set + persist it
+  // Every route is wrapped in guard() so HTTP Basic Auth (when a username is set) protects the whole
+  // dashboard/API. The two multipart upload routes additionally reject the body stream in their upload
+  // callback (authValid) so an unauthenticated POST can't push firmware before the guard runs.
+  server.on("/login",     HTTP_GET,  handleLoginPage);   // login form (unguarded)
+  server.on("/api/login", HTTP_POST, handleLogin);       // verify credentials -> session cookie (unguarded)
+  server.on("/api/logout",HTTP_POST, handleLogout);      // drop the session cookie
+  server.on("/", guard(handleIndex));
+  server.on("/api/readers", guard(handleReaders));
+  server.on("/api/status", guard(handleStatus));
+  server.on("/api/interval", HTTP_POST, guard(handleInterval));
+  server.on("/api/mqtt", HTTP_POST, guard(handleMqttCfg));
+  server.on("/api/auth", HTTP_POST, guard(handleAuthCfg));   // set web Basic Auth user/pass
+  server.on("/api/tz",   HTTP_POST, guard(handleTz));       // set the timezone (history day-buckets)
+  server.on("/api/wifi", HTTP_POST, guard(handleWifiPortal));        // open the on-demand WiFiManager portal (AP)
+  server.on("/api/wifi/scan", HTTP_GET, guard(handleWifiScan));      // list nearby networks (dashboard panel)
+  server.on("/api/wifi/connect", HTTP_POST, guard(handleWifiConnect)); // connect to a chosen network in-place
+  server.on("/api/rediscover", HTTP_POST, guard(handleRediscover));
+  server.on("/api/delete", HTTP_POST, guard(handleDelete));
+  server.on("/api/ota", HTTP_POST, guard(handleOtaDone), handleOtaUpload);   // reader firmware over LoRa
+  server.on("/api/ota_cancel", HTTP_POST, guard(handleOtaCancel));
+  server.on("/settings",        HTTP_GET,  guard(handleSettingsPage));       // WiFi + MQTT + firmware in one page
+  server.on("/api/github/latest", HTTP_GET,  guard(handleGithubLatest));     // check GitHub for the newest release
+  server.on("/api/github/update", HTTP_POST, guard(handleGithubUpdate));     // pull + flash the newest release .bin
+  server.on("/api/github/progress", HTTP_GET, guard(handleGithubProgress));  // live download/flash % for the UI
+  server.on("/update", HTTP_GET, guard(handleUpdatePage));                   // ESP32 self-update page (still linked from /settings)
+  server.on("/api/selfupdate", HTTP_POST, guard(handleSelfOtaDone), handleSelfOtaUpload);
+  server.on("/debug", HTTP_GET, guard(handleDebugPage));                     // flash hex editor
+  server.on("/api/flash/info",  HTTP_GET,  guard(handleFlashInfo));
+  server.on("/api/flash/read",  HTTP_GET,  guard(handleFlashRead));
+  server.on("/api/flash/patch", HTTP_POST, guard(handleFlashPatch));
+  server.on("/api/flash/erase", HTTP_POST, guard(handleFlashErase));
+  server.on("/api/efuse",       HTTP_GET,  guard(handleEfuse));
+  server.on("/api/reboot",      HTTP_POST, guard(handleReboot));   // restart the gateway from the dashboard
+  server.on("/api/factory_reset", HTTP_POST, guard(handleFactoryReset));  // wipe all settings + reboot to setup portal
+  server.on("/api/assign",      HTTP_POST, guard(handleAssign));   // accept/drop a reader onto this gateway
+  server.on("/api/pairall",     HTTP_POST, guard(handlePairAll));  // open the 3-min auto-accept window
+  server.on("/radio",           HTTP_GET,  guard(handleRadioPage));  // live radio message view
+  server.on("/api/radio",       HTTP_GET,  guard(handleRadioApi));
+  server.on("/history",         HTTP_GET,  guard(handleHistoryPage)); // per-reader energy history + charts
+  server.on("/api/history",     HTTP_GET,  guard(handleHistoryApi));
+  server.on("/api/history/clear", HTTP_POST, guard(handleHistoryClear));
+  server.on("/api/price",       HTTP_GET,  guard(handlePrice));        // read the € ct/kWh price
+  server.on("/api/price",       HTTP_POST, guard(handlePrice));        // set + persist it
+  static const char *collectHdrs[] = { "Cookie" };
+  server.collectHeaders(collectHdrs, 1);   // needed so server.header("Cookie") works for the login session
   }   // end one-time route registration
   server.begin();
-  mqtt.setServer(g_mqttHost, g_mqttPort);
+  applyMqttClient();                // pick plain/TLS socket + set the broker address
   mqtt.setBufferSize(768);          // HA discovery configs (with device block) exceed the 256B default
   mqtt.setCallback(mqttCallback);          // <base>/<id>/set_interval command topic
   bool sta = WiFi.status() == WL_CONNECTED;
@@ -2006,7 +2225,8 @@ static void mqttService() {
   static uint32_t lastTry = 0, lastPub = 0;
   uint32_t now = millis();
   g_mqttState = mqtt.state();
-  if (g_mqttHost[0] && !mqtt.connected() && now - lastTry > 8000) {
+  if (g_mqttHost[0] && !mqtt.connected() && (g_mqttReconnect || now - lastTry > 8000)) {
+    g_mqttReconnect = false;
     lastTry = now;
     String cid = "obi-gw-" + String(gwId());                    // unique client id per gateway
     String avt = avtTopic();                                    // per-gateway availability (LWT) topic
@@ -2175,6 +2395,10 @@ static void webTask(void *) {
   prefs.getString("u", "").toCharArray(g_mqttUser, sizeof g_mqttUser);
   prefs.getString("pw", "").toCharArray(g_mqttPass, sizeof g_mqttPass);
   { String t = prefs.getString("t", "obi/gateway"); t.toCharArray(g_mqttTopic, sizeof g_mqttTopic); }
+  g_mqttTls = prefs.getBool("tls", false);       // MQTTS on/off
+  g_mqttCa  = prefs.getString("ca", "");         // optional broker CA cert (PEM)
+  prefs.getString("au", "").toCharArray(g_authUser, sizeof g_authUser);   // web Basic Auth user (blank = open)
+  prefs.getString("ap", "").toCharArray(g_authPass, sizeof g_authPass);
   { String z = prefs.getString("tz", "CET-1CEST,M3.5.0,M10.5.0/3"); z.toCharArray(g_tz, sizeof g_tz); }
   g_priceCent = prefs.getFloat("pkwh", 31.0f);   // electricity price (€ ct/kWh) for the history cost columns
   prefs.end();
@@ -2216,7 +2440,7 @@ static void webTask(void *) {
       g_wifiOk = conn;
       if (conn) {
         if (g_apActive) { WiFi.softAPdisconnect(true); g_apActive = false; }
-        mqtt.setServer(g_mqttHost, g_mqttPort);
+        applyMqttClient();
         configTzTime(g_tz, "pool.ntp.org", "time.nist.gov");  // wall clock for history day-buckets (user-set zone)
         Serial.printf("[web] connected: http://%s/\n", WiFi.localIP().toString().c_str());
       } else if (!g_apActive) {
@@ -2245,8 +2469,13 @@ bool web_wifi_connected() { return WiFi.status() == WL_CONNECTED; }
 // unit. Clears WiFiManager's saved SSID/PSK and our MQTT settings; the caller reboots afterwards.
 void web_factory_reset() {
   wm.resetSettings();                 // erase saved WiFi credentials (WiFiManager NVS)
-  prefs.begin("obigw", false);        // erase MQTT host/port/user/pass/topic
+  prefs.begin("obigw", false);        // erase MQTT host/port/user/pass/topic + web login + tz + price
   prefs.clear();
   prefs.end();
-  Serial.println("[web] factory reset: WiFi + MQTT settings cleared");
+  // Reader state (own NVS namespaces, same ones the case-button reset wipes): UUIDs, bindings, intervals.
+  { Preferences p; p.begin("obiuuid",   false); p.clear(); p.end(); }   // stored reader UUIDs
+  { Preferences p; p.begin("obiassign", false); p.clear(); p.end(); }   // reader bindings (assigned/bound)
+  { Preferences p; p.begin("obiival",   false); p.clear(); p.end(); }   // per-reader upload intervals
+  if (g_fsOk) LittleFS.format();       // wipe the per-reader energy history (LittleFS holds only history)
+  Serial.println("[web] factory reset: WiFi + MQTT + login + bound readers + history cleared");
 }
