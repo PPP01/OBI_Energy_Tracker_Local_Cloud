@@ -94,6 +94,7 @@ static char     g_mqttTopic[48] = "obi/gateway";
 static bool     g_mqttTls = false;   // MQTTS: wrap the MQTT socket in TLS (WiFiClientSecure). Broker side only.
 static String   g_mqttCa;            // optional PEM CA cert to verify the broker; empty = encrypt-only (setInsecure)
 static char     g_tz[48] = "CET-1CEST,M3.5.0,M10.5.0/3";   // POSIX TZ for the history day-buckets (user-settable)
+static char     g_ntp[64] = "pool.ntp.org";                // NTP server for the wall clock (user-settable)
 static uint16_t g_pubEvery = 15;
 
 // HTTP Basic Auth for the whole web dashboard/API. Blank username = auth disabled (open, backward compatible).
@@ -204,7 +205,7 @@ static String statusJson() {
   j += ",\"uptime_s\":" + String(gw_uptime_s());
   { time_t tnow = time(nullptr); struct tm lt; localtime_r(&tnow, &lt); char tb[24];
     strftime(tb, sizeof tb, "%Y-%m-%d %H:%M:%S", &lt);
-    j += ",\"tz\":" + jstr(g_tz) + ",\"time\":\"" + String(tb) + "\",\"time_valid\":" + String(tnow > 1735689600 ? "true" : "false"); }
+    j += ",\"tz\":" + jstr(g_tz) + ",\"ntp\":" + jstr(g_ntp) + ",\"time\":\"" + String(tb) + "\",\"time_valid\":" + String(tnow > 1735689600 ? "true" : "false"); }
   j += ",\"wifi\":" + String(g_wifiOk ? "true" : "false");
   j += ",\"ip\":\"" + (g_wifiOk ? WiFi.localIP().toString() : String("-")) + "\"";
   j += ",\"wifi_rssi\":" + String(g_wifiOk ? WiFi.RSSI() : 0);
@@ -729,17 +730,27 @@ static void handleAuthCfg() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// Set the timezone (POSIX TZ string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3"). Persisted, applied IMMEDIATELY so the
-// history day-buckets re-align without a reboot; re-syncs NTP with the new zone if WiFi is up.
+// (Re)start the SNTP client with the user-set NTP server (custom first, public pools as fallback) and zone.
+static void syncNtp() {
+  configTzTime(g_tz, g_ntp, "pool.ntp.org", "time.nist.gov");
+}
+
+// Set the timezone (POSIX TZ string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3") and/or the NTP server. Persisted,
+// applied IMMEDIATELY so the history day-buckets re-align without a reboot; re-syncs NTP if WiFi is up.
 static void handleTz() {
   if (server.hasArg("tz") && server.arg("tz").length()) {
     strlcpy(g_tz, server.arg("tz").c_str(), sizeof g_tz);
     prefs.begin("obigw", false); prefs.putString("tz", g_tz); prefs.end();
     setenv("TZ", g_tz, 1); tzset();
-    if (WiFi.status() == WL_CONNECTED) configTzTime(g_tz, "pool.ntp.org", "time.nist.gov");
     Serial.printf("[tz] set %s\n", g_tz);
   }
-  server.send(200, "application/json", String("{\"ok\":true,\"tz\":") + jstr(g_tz) + "}");
+  if (server.hasArg("ntp") && server.arg("ntp").length()) {
+    strlcpy(g_ntp, server.arg("ntp").c_str(), sizeof g_ntp);
+    prefs.begin("obigw", false); prefs.putString("ntp", g_ntp); prefs.end();
+    Serial.printf("[ntp] set %s\n", g_ntp);
+  }
+  if (WiFi.status() == WL_CONNECTED) syncNtp();
+  server.send(200, "application/json", String("{\"ok\":true,\"tz\":") + jstr(g_tz) + ",\"ntp\":" + jstr(g_ntp) + "}");
 }
 
 // ---- reader firmware OTA upload (multipart, .bin) --------------------------
@@ -1091,6 +1102,7 @@ button:disabled{opacity:.5;cursor:default}
    <option value="">— custom / POSIX —</option>
   </select>
   <label>POSIX TZ</label><input id=tztext placeholder="CET-1CEST,M3.5.0,M10.5.0/3">
+  <label id=lntp>NTP-Server</label><input id=ntptext placeholder="pool.ntp.org">
   <div class=row><button onclick=saveTz()><span id=btz>Speichern</span></button><span class=msg id=tzmsg></span></div>
  </div>
 
@@ -1131,7 +1143,7 @@ $('lman2').textContent=t('Manuell flashen (.bin dieses Boards)','Manual flash (.
 $('lfr').textContent=t('Werkseinstellungen','Factory reset');$('bfr').textContent=t('Auf Werkseinstellungen zurücksetzen','Reset to factory settings');
 $('frnote').textContent=t('Löscht WLAN, MQTT, Login, gebundene Reader und den Verlauf — dann Neustart ins Setup-Portal.','Erases WiFi, MQTT, login, bound readers and history — then reboots into the setup portal.');
 $('ghbtn').textContent=t('Auf Updates prüfen','Check for updates');$('ghdl').textContent=t('Neueste neu laden','Redownload latest');
-$('htime').textContent=t('Zeit','Time');$('ltz').textContent=t('Zeitzone','Timezone');$('btz').textContent=t('Speichern','Save');
+$('htime').textContent=t('Zeit','Time');$('ltz').textContent=t('Zeitzone','Timezone');$('lntp').textContent=t('NTP-Server','NTP server');$('btz').textContent=t('Speichern','Save');
 let cfg=false,tzc=false;
 async function load(){try{
   const s=await(await fetch('/api/status')).json();
@@ -1145,11 +1157,12 @@ async function load(){try{
   $('austat').innerHTML=(s.auth&&s.auth.enabled)?`<span class="dot on"></span>${t('geschützt als','protected as')} <code>${s.auth.user}</code>`:`<span class="dot idle"></span>${t('offen — kein Passwort','open — no password')}`;
   $('fwcur').innerHTML=`${t('Aktuell','Current')}: <code>${s.fw?s.fw.version:'?'}</code> (${s.fw?s.fw.target:''})`;
   $('tzstat').innerHTML=(s.time_valid?'<span class="dot on"></span>':'<span class="dot idle"></span>')+`${t('Gerätezeit','Device time')}: <code>${s.time||'?'}</code>`+(s.time_valid?'':` · ${t('noch nicht per NTP synchronisiert','not NTP-synced yet')}`);
-  if(!tzc){tzc=true;$('tztext').value=s.tz||'';$('tzsel').value=s.tz||'';if($('tzsel').value!==(s.tz||''))$('tzsel').value='';}
+  if(!tzc){tzc=true;$('tztext').value=s.tz||'';$('ntptext').value=s.ntp||'';$('tzsel').value=s.tz||'';if($('tzsel').value!==(s.tz||''))$('tzsel').value='';}
 }catch(e){}}
 function tzPick(){const v=$('tzsel').value;if(v)$('tztext').value=v;}
 async function saveTz(){const z=$('tztext').value.trim();if(!z){$('tzmsg').textContent=t('TZ eingeben','enter a TZ');return;}
- $('tzmsg').textContent='…';try{await fetch('/api/tz',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'tz='+encodeURIComponent(z)});}catch(e){}
+ const n=$('ntptext').value.trim();if(!n){$('tzmsg').textContent=t('NTP-Server eingeben','enter an NTP server');return;}
+ $('tzmsg').textContent='…';try{await fetch('/api/tz',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'tz='+encodeURIComponent(z)+'&ntp='+encodeURIComponent(n)});}catch(e){}
  $('tzmsg').textContent=t('gespeichert ✓','saved ✓');setTimeout(()=>$('tzmsg').textContent='',3000);load();}
 async function scan(){$('wfmsg').textContent=t('suche…','scanning…');$('bscan').disabled=true;
  try{let n=await(await fetch('/api/wifi/scan')).json();n.sort((a,b)=>b.rssi-a.rssi);let seen={},o=`<option value="">${t('— Netzwerk wählen —','— pick a network —')}</option>`;
@@ -2530,6 +2543,7 @@ static void webTask(void *) {
   prefs.getString("au", "").toCharArray(g_authUser, sizeof g_authUser);   // web Basic Auth user (blank = open)
   prefs.getString("ap", "").toCharArray(g_authPass, sizeof g_authPass);
   { String z = prefs.getString("tz", "CET-1CEST,M3.5.0,M10.5.0/3"); z.toCharArray(g_tz, sizeof g_tz); }
+  { String n = prefs.getString("ntp", "pool.ntp.org"); n.toCharArray(g_ntp, sizeof g_ntp); }
   g_priceCent = prefs.getFloat("pkwh", 31.0f);   // electricity price (€ ct/kWh) for the history cost columns
   prefs.end();
   setenv("TZ", g_tz, 1); tzset();                // apply the saved zone up-front (localtime works before NTP too)
@@ -2571,7 +2585,7 @@ static void webTask(void *) {
       if (conn) {
         if (g_apActive) { WiFi.softAPdisconnect(true); g_apActive = false; }
         applyMqttClient();
-        configTzTime(g_tz, "pool.ntp.org", "time.nist.gov");  // wall clock for history day-buckets (user-set zone)
+        syncNtp();  // wall clock for history day-buckets (user-set zone + NTP server)
         Serial.printf("[web] connected: http://%s/\n", WiFi.localIP().toString().c_str());
       } else if (!g_apActive) {
         WiFi.mode(WIFI_AP_STA); WiFi.softAP(apSsid()); g_apActive = true;
