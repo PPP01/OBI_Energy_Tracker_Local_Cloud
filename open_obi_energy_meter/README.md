@@ -20,7 +20,7 @@ vendor cloud.
 
 ---
 
-## Screenshots — the firmware running on a stock OBI C3
+## Screenshots — the Custom firmware running on a stock OBI Gateway
 
 Everything below is served straight from the ESP32 — no app, no cloud. Open `http://<gateway-ip>/` in any
 browser (phone or desktop), pick DE/EN with the toggle top-right.
@@ -333,7 +333,7 @@ festhängt. Keine Hersteller-Bridge, keine Hersteller-Cloud.
 
 ---
 
-## Screenshots — die Firmware auf einem originalen OBI C3
+## Screenshots — die Custom Firmware auf einem originalen OBI Gateway
 
 Alles unten kommt direkt vom ESP32 — keine App, keine Cloud. Öffne `http://‹gateway-ip›/` in einem beliebigen
 Browser (Handy oder Desktop), oben rechts per Umschalter DE/EN wählen.
