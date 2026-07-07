@@ -44,7 +44,7 @@ const uint8_t GWID[6] = { 'O', 'B', 'I', 'E', 'S', 'P' };
 SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 
 // ---- per-reader state (struct in reader.h, shared with the web/MQTT module) --
-const int MAX_READERS = 64;   // ~92 B/entry -> ~6 KB RAM for 64; the real ceiling is LoRa airtime, not memory
+const int MAX_READERS = 64;   // ~117 B/entry -> ~7.5 KB RAM for 64; the real ceiling is LoRa airtime, not memory
 Reader readers[MAX_READERS];
 
 // Default upload interval (seconds) for a NEW reader that the user hasn't configured yet. A fresh reader is
@@ -119,6 +119,21 @@ static uint16_t loadInterval(const uint8_t h[3]) {
   return v;
 }
 
+// Per-reader friendly name, persisted like the interval so it survives reboot AND re-pair.
+static void saveName(const uint8_t h[3], const char *name) {
+  char k[8]; uuidKey(h, k);
+  Preferences p; p.begin("obiname", false);
+  if (name && name[0]) p.putString(k, name); else p.remove(k);
+  p.end();
+}
+static void loadName(const uint8_t h[3], char *out, size_t outsz) {
+  char k[8]; uuidKey(h, k);
+  Preferences p; p.begin("obiname", true);
+  out[0] = 0;
+  p.getString(k, out, outsz);
+  p.end();
+}
+
 // Auto-pair window: while active, every reader that announces is accepted automatically.
 static uint32_t g_pairUntil = 0;
 static bool pairWindowActive() { return g_pairUntil && (int32_t)(millis() - g_pairUntil) < 0; }
@@ -133,6 +148,7 @@ static Reader *addReader(const uint8_t h[3]) {
     x.assigned = loadAssigned(h);                   // restore the accept flag (auto-binds on sight)
     uint16_t iv = loadInterval(h);                  // persisted upload interval (0 = never configured)
     x.setInterval = iv ? iv : OBI_DEFAULT_INTERVAL; // new/unconfigured reader -> default, so it's shown in UI/MQTT AND pushed in the ACK
+    loadName(h, x.name, sizeof x.name);             // restore the friendly name (empty = none set)
     return &x;
   }
   return nullptr;
@@ -260,6 +276,31 @@ bool gw_assign_reader(const uint8_t handle[3], bool on) {
       return true;
     }
   return true;   // persisted even if the reader isn't currently in the live list
+}
+// Set (or clear, with "") a reader's user-visible friendly name. Bounded copy; a 24-byte cut can land
+// inside a UTF-8 sequence, so trailing incomplete sequences are dropped. Control chars would break the
+// hand-built JSON (jstr only escapes quote/backslash), so they become spaces.
+// Only accepted for a known (live) reader; the HTTP layer turns a false return into a 400.
+bool gw_set_reader_name(const uint8_t handle[3], const char *name) {
+  char buf[25];
+  strlcpy(buf, name ? name : "", sizeof buf);
+  for (char *c = buf; *c; c++) if ((uint8_t)*c < 0x20) *c = ' ';
+  size_t n = strlen(buf), i = n;
+  while (i && ((uint8_t)buf[i - 1] & 0xC0) == 0x80) i--;    // back over continuation bytes
+  if (i && (uint8_t)buf[i - 1] >= 0xC0) {                   // lead byte: sequence complete?
+    uint8_t lead = (uint8_t)buf[i - 1];
+    size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : 2;
+    if (n - (i - 1) < need) n = i - 1;                      // incomplete -> drop the whole sequence
+  }
+  buf[n] = 0;
+  for (auto &r : readers)
+    if (r.used && !memcmp(r.handle, handle, 3)) {
+      saveName(handle, buf);
+      strlcpy(r.name, buf, sizeof r.name);
+      r.mqttDiscovered = false;   // re-announce HA discovery so the device shows the new name
+      return true;
+    }
+  return false;
 }
 // Open a window during which every announcing reader is auto-accepted (default 3 min from the web button).
 void gw_pair_all(uint16_t seconds) {

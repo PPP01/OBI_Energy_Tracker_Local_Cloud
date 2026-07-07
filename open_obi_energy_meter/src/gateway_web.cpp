@@ -163,6 +163,7 @@ static String readersJson() {
     first = false;
     uint32_t age = (millis() - r.lastSeenMs) / 1000;
     j += "{\"id\":\"" + hex(r.handle, 3) + "\"";
+    j += ",\"name\":" + jstr(r.name);
     j += ",\"uuid\":" + (r.haveUuid ? "\"" + uuidStr(r.uuid) + "\"" : "null");
     j += ",\"type\":\"" + String(typeName(r.devType)) + "\"";
     j += ",\"paired\":" + String(r.haveKey ? "true" : "false");
@@ -275,6 +276,9 @@ h1{font-size:16px;margin:0;font-weight:650}.sub{color:var(--dim);font-size:12px}
 .meta{color:var(--dim);font-size:12px;font-family:var(--mono)}
 .del{margin-left:auto;background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:7px;padding:3px 9px;cursor:pointer;font-size:13px;line-height:1}
 .del:hover{border-color:var(--red);color:var(--red)}
+.ren{background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:7px;padding:3px 8px;cursor:pointer;font-size:12px;line-height:1}
+.ren:hover{border-color:var(--accent);color:var(--accent)}
+.nmi{width:210px;max-width:55vw;font-size:16px;font-weight:600;padding:6px 9px}
 .uuid{font-family:var(--mono);font-size:11.5px;color:var(--dim);word-break:break-all;margin:7px 0 13px;
  padding:6px 9px;background:#0d131b;border-radius:8px;border:1px solid #1a222d}
 .uuid b{color:#9fb0c4;letter-spacing:.5px}
@@ -378,6 +382,7 @@ const T={
   vnote:'Die Firmware-Version MUSS im Dateinamen stehen, z.B. reader_v55.bin.',
   novers:'Keine Version im Dateinamen gefunden.\nBitte die richtige Firmware-Version in den Dateinamen schreiben, z.B. reader_v55.bin',
   vmiss:'Version fehlt im Dateinamen',
+  ren:'Name ändern',abort:'Abbrechen',
   samever:'Der Reader läuft bereits auf v%v — er akzeptiert dieselbe Version nicht (kein Reflash).\n\nTrotzdem versuchen?'},
  en:{sub:'869.5 MHz · SF7 · reading your meters directly',wifi:'WiFi',mqtt:'MQTT',radio:'Radio',readers:'Readers',
   offline:'offline',fw:'Firmware',batt:'Battery',opt:'Sensor',active:'active',nosig:'no signal',
@@ -399,6 +404,7 @@ const T={
   vnote:'The firmware version MUST be in the filename, e.g. reader_v55.bin.',
   novers:'No version found in the filename.\nPut the correct firmware version in the filename, e.g. reader_v55.bin',
   vmiss:'version missing in filename',
+  ren:'Rename',abort:'Cancel',
   samever:'The reader is already on v%v — it will not accept the same version (no reflash).\n\nTry anyway?'}};
 let lang=localStorage.getItem('lang')||'de',L=T[lang];
 function setLang(x){lang=x;L=T[x];localStorage.setItem('lang',x);applyLang();tick();}
@@ -432,7 +438,7 @@ function bcol(p){return p>50?'var(--accent)':p>20?'var(--amber)':'var(--red)'}
 function fmt(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+(h?h+'h ':'')+m+'m'}
 let cfgLoaded=false;
 async function tick(){try{
- const st=await (await fetch('/api/status')).json(), rs=await (await fetch('/api/readers')).json();
+ const st=await (await fetch('/api/status')).json(), rs=await (await fetch('/api/readers')).json();_rs=rs;
  $('#logout_btn').style.display=(st.auth&&st.auth.enabled)?'':'none';   // only show logout when a login is required
  $('#sub').textContent='OBI Gateway '+(st.gw||st.gwid).toUpperCase();
  $('#gw').textContent=st.gwid_ascii+' · '+(st.mac||st.gwid);
@@ -449,19 +455,26 @@ async function tick(){try{
  ].concat(st.temp_c!=null?[['Temp',`<b>${st.temp_c} °C</b>`]]:[])
   .map(p=>`<div class="pill"><span class="k">${p[0]}</span>${p[1]}</div>`).join('');
  $('#pair_st').textContent=st.pair_remaining_s>0?L.pairon.replace('%s',st.pair_remaining_s):L.pairoff;
- // don't blow away a reader card while its interval/file input is focused (you'd never finish typing)
- const ae=document.activeElement, editing=ae&&/^(iv_|fw_)/.test(ae.id||'');
+ // don't blow away a reader card while its interval/file input is focused (you'd never finish typing);
+ // renId keeps the inline rename field alive even if it loses focus (e.g. after tapping elsewhere on mobile)
+ const ae=document.activeElement, editing=renId!==null||(ae&&/^(iv_|fw_)/.test(ae.id||''));
  if(!editing && !uploading) $('#list').innerHTML=rs.length?rs.map(card).join(''):`<div class="card"><div class="hd"><span class="id">—</span></div><div class="uuid" style="border:0;background:0">${L.waiting}</div></div>`;
  if(st.ota&&st.ota.active){const el=$('#op_'+st.ota.target);if(el){const p=st.ota.size?Math.min(100,Math.max(0,Math.round(st.ota.served/st.ota.size*100))):0;el.textContent=L.otarun+' '+p+'%';}}
 }catch(e){}}
 function card(r){
  const p=Math.max(0,Math.min(100,Math.round((r.battery_mV-2400)/8)));
  const sens=r.infrared?`<span class="dot on"></span>${L.active}`:`<span class="dot idle"></span>${L.nosig}`;
+ const nm=r.name?esc(r.name):'';
  return `<div class="card${r.assigned?'':' pending'}">
-  <div class="hd"><span class="id">${r.id.toUpperCase()}</span>
+  <div class="hd">${renId===r.id
+   ?`<input class="nmi" id="nm_${r.id}" maxlength="24" value="${esc(r.name||'')}" placeholder="${r.id.toUpperCase()}" onkeydown="nmKey(event,'${r.id}')">
+   <button class="ren" onclick="nmSave('${r.id}')" title="${L.save}">✓</button>
+   <button class="ren" onclick="nmCancel()" title="${L.abort}">✕</button>`
+   :`<span class="id">${nm||r.id.toUpperCase()}</span>
+   <button class="ren" onclick="renameRd('${r.id}')" title="${L.ren}">✎</button>`}
    <span class="tag ${r.type}">${r.type}</span>
    ${r.assigned?'':`<span class="tag pend">${L.pending}</span>`}
-   <span class="meta">FW ${r.softver} · HW ${r.hardver}${r.legacy?' · legacy':''} · ${r.rssi} dBm · ${r.snr} dB${r.paired?' · 🔒':''}</span>
+   <span class="meta">${nm?r.id.toUpperCase()+' · ':''}FW ${r.softver} · HW ${r.hardver}${r.legacy?' · legacy':''} · ${r.rssi} dBm · ${r.snr} dB${r.paired?' · 🔒':''}</span>
    <button class="del" onclick="delReader('${r.id}')" title="${L.del}">✕</button></div>
   <div class="uuid">${r.uuid?('<b>UUID</b> '+r.uuid):L.uuidwait}</div>
   ${r.bootloader?`<div class="boot">⚙ ${L.boot}</div>`:''}
@@ -484,6 +497,14 @@ function card(r){
   ${r.assigned&&!r.has_data&&!r.bootloader?`<div class="hint">⚠ ${L.irhint}</div>`:''}
  </div>`;
 }
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let _rs=[],renId=null;                       // renId = reader currently in inline-rename mode (tick pauses redraws)
+function redraw(){$('#list').innerHTML=_rs.map(card).join('');}
+function renameRd(id){renId=id;redraw();const el=$('#nm_'+id);if(el){el.focus();el.select();}}
+function nmCancel(){renId=null;redraw();}
+async function nmSave(id){const v=$('#nm_'+id).value.trim().slice(0,24);renId=null;
+ await fetch('/api/name?id='+id+'&name='+encodeURIComponent(v),{method:'POST'});tick();}
+function nmKey(e,id){if(e.key==='Enter')nmSave(id);else if(e.key==='Escape')nmCancel();}
 async function setIv(id){const v=$('#iv_'+id).value;if(!v)return;await fetch('/api/interval?id='+id+'&seconds='+v,{method:'POST'});tick();}
 async function assignRd(id,on){await fetch('/api/assign?id='+id+'&on='+on,{method:'POST'});tick();}
 async function pairAll(){await fetch('/api/pairall',{method:'POST'});tick();}
@@ -655,6 +676,17 @@ static void handleInterval() {
     gw_request_interval(h, (uint16_t)secs);
     server.send(200, "application/json", "{\"ok\":true}");
   } else server.send(400, "application/json", "{\"ok\":false}");
+}
+
+// Set (or clear, empty name) a reader's friendly display name. WebServer already url-decodes arg().
+static void handleName() {
+  String id = server.arg("id");
+  if (id.length() != 6) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  uint8_t h[3];
+  for (int i = 0; i < 3; i++) h[i] = (uint8_t)strtol(id.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+  if (gw_set_reader_name(h, server.arg("name").c_str()))
+    server.send(200, "application/json", "{\"ok\":true}");
+  else server.send(400, "application/json", "{\"ok\":false}");
 }
 
 static void handleMqttCfg() {
@@ -1841,7 +1873,7 @@ async function boot(){
  try{let d=await (await fetch('/api/readers')).json();readers=Array.isArray(d)?d:(d.readers||[]);}catch(e){readers=[];}
  readers=readers.filter(r=>r.id);
  if(!readers.length){main.innerHTML='<div class=card><div class=empty>'+t('noReaders')+'</div></div>';sel.innerHTML='<option>—</option>';return;}
- sel.innerHTML=readers.map(r=>`<option value="${r.id}">${esc(r.type||'reader')} · ${r.id}</option>`).join('');
+ sel.innerHTML=readers.map(r=>`<option value="${r.id}">${esc(r.name||r.type||'reader')} · ${r.id}</option>`).join('');
  let saved=localStorage.getItem('obihist');
  cur=readers.some(r=>r.id===saved)?saved:readers[0].id;
  sel.value=cur;
@@ -2004,6 +2036,7 @@ static void startServices() {
   server.on("/api/reboot",      HTTP_POST, guard(handleReboot));   // restart the gateway from the dashboard
   server.on("/api/factory_reset", HTTP_POST, guard(handleFactoryReset));  // wipe all settings + reboot to setup portal
   server.on("/api/assign",      HTTP_POST, guard(handleAssign));   // accept/drop a reader onto this gateway
+  server.on("/api/name",        HTTP_POST, guard(handleName));    // set/clear a reader's friendly name
   server.on("/api/pairall",     HTTP_POST, guard(handlePairAll));  // open the 3-min auto-accept window
   server.on("/radio",           HTTP_GET,  guard(handleRadioPage));  // live radio message view
   server.on("/api/radio",       HTTP_GET,  guard(handleRadioApi));
@@ -2140,8 +2173,11 @@ static void publishDiscovery(const Reader &r) {
   String stt = String(g_mqttTopic) + "/" + id;         // state topic (the JSON)
   String cmd = stt + "/set_interval";                  // command topic (number -> interval)
   String avt = avtTopic();                             // per-gateway LWT: online/offline
-  String dev = "\"dev\":{\"ids\":[\"" + uid + "\"],\"name\":\"OBI " + typeName(r.devType) + " " + id +
-               "\",\"mf\":\"OBI\",\"mdl\":\"" + typeName(r.devType) +
+  // device name: the user-set friendly name when present (Tasmota-style), else the technical default.
+  // Safe to change later: entity ids/history hang off uniq_id + state topic, both stay untouched.
+  String dev = "\"dev\":{\"ids\":[\"" + uid + "\"],\"name\":" +
+               (r.name[0] ? jstr(r.name) : "\"OBI " + String(typeName(r.devType)) + " " + id + "\"") +
+               ",\"mf\":\"OBI\",\"mdl\":\"" + String(typeName(r.devType)) +
                "\",\"sw\":\"" + String(r.softver) + "\",\"hw\":\"" + String(r.hardver) + "\"}";
 
   // --- sensors (dc/unit/sc == nullptr -> that field is omitted from the config) ---
