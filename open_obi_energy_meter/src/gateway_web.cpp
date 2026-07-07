@@ -1860,7 +1860,7 @@ async function boot(){
  try{let d=await (await fetch('/api/readers')).json();readers=Array.isArray(d)?d:(d.readers||[]);}catch(e){readers=[];}
  readers=readers.filter(r=>r.id);
  if(!readers.length){main.innerHTML='<div class=card><div class=empty>'+t('noReaders')+'</div></div>';sel.innerHTML='<option>—</option>';return;}
- sel.innerHTML=readers.map(r=>`<option value="${r.id}">${esc(r.type||'reader')} · ${r.id}</option>`).join('');
+ sel.innerHTML=readers.map(r=>`<option value="${r.id}">${esc(r.name||r.type||'reader')} · ${r.id}</option>`).join('');
  let saved=localStorage.getItem('obihist');
  cur=readers.some(r=>r.id===saved)?saved:readers[0].id;
  sel.value=cur;
