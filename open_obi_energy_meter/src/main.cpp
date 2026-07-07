@@ -44,7 +44,7 @@ const uint8_t GWID[6] = { 'O', 'B', 'I', 'E', 'S', 'P' };
 SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 
 // ---- per-reader state (struct in reader.h, shared with the web/MQTT module) --
-const int MAX_READERS = 64;   // ~92 B/entry -> ~6 KB RAM for 64; the real ceiling is LoRa airtime, not memory
+const int MAX_READERS = 64;   // ~117 B/entry -> ~7.5 KB RAM for 64; the real ceiling is LoRa airtime, not memory
 Reader readers[MAX_READERS];
 
 // Default upload interval (seconds) for a NEW reader that the user hasn't configured yet. A fresh reader is
@@ -280,7 +280,8 @@ bool gw_assign_reader(const uint8_t handle[3], bool on) {
 // Set (or clear, with "") a reader's user-visible friendly name. Bounded copy; a 24-byte cut can land
 // inside a UTF-8 sequence, so trailing incomplete sequences are dropped. Control chars would break the
 // hand-built JSON (jstr only escapes quote/backslash), so they become spaces.
-void gw_set_reader_name(const uint8_t handle[3], const char *name) {
+// Only accepted for a known (live) reader; the HTTP layer turns a false return into a 400.
+bool gw_set_reader_name(const uint8_t handle[3], const char *name) {
   char buf[25];
   strlcpy(buf, name ? name : "", sizeof buf);
   for (char *c = buf; *c; c++) if ((uint8_t)*c < 0x20) *c = ' ';
@@ -292,9 +293,13 @@ void gw_set_reader_name(const uint8_t handle[3], const char *name) {
     if (n - (i - 1) < need) n = i - 1;                      // incomplete -> drop the whole sequence
   }
   buf[n] = 0;
-  saveName(handle, buf);
   for (auto &r : readers)
-    if (r.used && !memcmp(r.handle, handle, 3)) { strlcpy(r.name, buf, sizeof r.name); return; }
+    if (r.used && !memcmp(r.handle, handle, 3)) {
+      saveName(handle, buf);
+      strlcpy(r.name, buf, sizeof r.name);
+      return true;
+    }
+  return false;
 }
 // Open a window during which every announcing reader is auto-accepted (default 3 min from the web button).
 void gw_pair_all(uint16_t seconds) {

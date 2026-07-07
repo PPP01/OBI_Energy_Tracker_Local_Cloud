@@ -47,7 +47,7 @@ bool gw_delete_reader(const uint8_t handle[3]);                       // drop a 
 uint32_t gw_uptime_s();
 // reader pairing gating (opt-in): a reader is only bound/keyed once assigned to this gateway
 bool gw_assign_reader(const uint8_t handle[3], bool on);              // accept (or drop) a reader onto this gateway
-void gw_set_reader_name(const uint8_t handle[3], const char *name);   // set ("" clears) the friendly name
+bool gw_set_reader_name(const uint8_t handle[3], const char *name);   // set ("" clears) the friendly name; false = unknown reader
 void gw_pair_all(uint16_t seconds);                                   // open a window that auto-assigns every reader
 uint32_t gw_pair_remaining_s();                                       // seconds left in the auto-pair window (0 = off)
 

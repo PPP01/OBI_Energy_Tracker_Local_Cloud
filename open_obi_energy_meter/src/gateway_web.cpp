@@ -676,8 +676,9 @@ static void handleName() {
   if (id.length() != 6) { server.send(400, "application/json", "{\"ok\":false}"); return; }
   uint8_t h[3];
   for (int i = 0; i < 3; i++) h[i] = (uint8_t)strtol(id.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
-  gw_set_reader_name(h, server.arg("name").c_str());
-  server.send(200, "application/json", "{\"ok\":true}");
+  if (gw_set_reader_name(h, server.arg("name").c_str()))
+    server.send(200, "application/json", "{\"ok\":true}");
+  else server.send(400, "application/json", "{\"ok\":false}");
 }
 
 static void handleMqttCfg() {
