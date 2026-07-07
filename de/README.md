@@ -13,6 +13,15 @@ mit dem Reader spricht — damit dir die gekaufte Hardware wirklich gehört.
 
 > ➡️ **Einfachste Schritt‑für‑Schritt‑Anleitung: [../ANLEITUNG.md](../ANLEITUNG.md)** (1‑to‑Done).
 
+### ⚡ Eigene Open-Source-Firmware direkt auf das originale OBI Gateway flashen → **[Open ESP32-C3 Gateway-Firmware](../open_obi_energy_meter/)**
+Eine komplette **Open-Source-ESP32-C3-Firmware**, die das Hersteller-Gateway **vollständig ersetzt**. Sie
+läuft **allgemein auf ESP32 + SX1262** (z. B. Heltec, LILYGO, Seeed XIAO) — **und speziell auch auf dem
+originalen OBI/heyOBI-Gateway**, wo sie **per OTA installiert** wird (kein UART/Löten, der Bootloader ist
+gesperrt). Sie koppelt die LoRa-Reader selbst, dekodiert die Energie auf dem Gerät und bietet ein
+**lokales Web-Dashboard + MQTT / MQTTS** mit Home-Assistant-Discovery — plus Reader-OTA und Self-Update.
+
+Schritt-für-Schritt vom Stock- zum eigenen Gateway: **[Open OBI Energy Meter](../open_obi_energy_meter/)**.
+
 ## Das System auf einen Blick
 ```mermaid
 flowchart LR

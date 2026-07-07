@@ -13,19 +13,23 @@ and shows how to **run the device against your own cloud** or **talk to the read
 > vendor's cloud; the goal is local ownership and interoperability.
 
 ---
+
+### ⚡ Flash open-source firmware straight onto the original OBI Gateway → **[Open ESP32-C3 gateway firmware](open_obi_energy_meter/)**
+A complete **open-source ESP32-C3 firmware** that **replaces the vendor bridge outright**. It runs
+**on generic ESP32 + SX1262 boards** (Heltec, LILYGO, Seeed XIAO, …) — **and specifically on the original
+OBI/heyOBI Gateway**, where it is **installed over-the-air via OTA** (no UART/soldering — the bootloader is
+locked). It pairs the LoRa readers itself, decodes the energy on-device, and gives you a **local web
+dashboard + MQTT / MQTTS** with Home-Assistant discovery — plus reader-OTA and self-update.
+
+Jump to the [**step-by-step stock → custom guide**](#stock-to-custom) (EN + DE), or read the full German
+walkthrough → **[de/README.md](https://github.com/atc1441/OBI_Energy_Tracker_Local_Cloud/blob/main/de/README.md)**.
+
 This repo is made together with these explanation videos:(click on the image)
 
 [![YoutubeVideo](https://img.youtube.com/vi/2jMEaRuSJ18/0.jpg)](https://www.youtube.com/watch?v=2jMEaRuSJ18)
 
 
 [![YoutubeVideo](https://img.youtube.com/vi/U4Vvf0kHnEk/0.jpg)](https://www.youtube.com/watch?v=U4Vvf0kHnEk)
-
-
-### ⚡ Want to **ditch the cloud completely?** → **[Open ESP32-C3 gateway firmware](open_obi_energy_meter/)**
-Replaces the vendor bridge outright: pairs the LoRa readers itself, decodes the energy, and gives you a
-**local web dashboard + MQTT / MQTTS** with Home-Assistant discovery — plus reader-OTA and self-update.
-Runs on the **original OBI C3 hardware** and on generic ESP32 + SX1262 boards. Jump to the
-[**step-by-step stock → custom guide**](#stock-to-custom) (EN + DE).
 
 ### 👉 Just want your own cloud working? → **[QUICKSTART.md](QUICKSTART.md)** (1‑to‑Done, start to finish)
 
