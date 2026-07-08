@@ -121,7 +121,7 @@ Direktes Flashen über UART/JTAG geht **nicht** (Bootloader per eFuse gesperrt).
 ```bash
 python mqtts_server.py --host 0.0.0.0 --port 8883 --ota-firmware fw.bin
 ```
-```fw.bin``` ist Platzhalter für Dein gewähltes Firmware image. Das aktuellste hat ein wartungsfreundliches **Webinterface** mit dem Du z. B. den OBI Energy Tracker einfach mit Deinem **Home Assistant** verbinden kannst. Herunterladen bei [Releases](https://github.com/atc1441/OBI_Energy_Tracker_Local_Cloud/releases).
+```fw.bin``` ist Platzhalter für Dein gewähltes Firmware image. Das aktuellste hat ein wartungsfreundliches **Webinterface** mit dem Du z. B. den OBI Energy Tracker einfach mit Deinem **Home Assistant** verbinden kannst. Herunterladen bei [Releases](/releases).
 
 Der Broker schickt den Offer, das Gerät zieht das Image in 512‑Byte‑Chunks und rebootet bei 100 %.
 Stock‑Image zum Flashen holst du mit `tools/obi_ota_download.py`.
