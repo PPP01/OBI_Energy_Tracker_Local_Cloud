@@ -135,6 +135,8 @@ static String uuidStr(const uint8_t *u) {
 }
 static const char *typeName(uint8_t t) { return t == 0x11 ? "outlet" : "meter"; }
 static String jnum(uint32_t v) { return obi_na(v) ? String("null") : String((unsigned long)v); }
+// power is a SIGNED int32 on the wire — it goes negative on feed-in/export. 0x7FFFFFFF still means n/a.
+static String jnumS(uint32_t v) { return obi_na(v) ? String("null") : String((long)(int32_t)v); }
 static const char *mqttStateText(int s) {
   switch (s) {
     case -4: return "timeout"; case -3: return "conn lost"; case -2: return "connect failed";
@@ -175,7 +177,7 @@ static String readersJson() {
     j += ",\"rssi\":" + String((int)r.lastRssi);
     j += ",\"snr\":" + String(r.lastSnr, 1);
     j += ",\"infrared\":" + String((r.flags & 1) ? "true" : "false");
-    j += ",\"import\":" + jnum(r.import_) + ",\"export\":" + jnum(r.export_) + ",\"power\":" + jnum(r.power);
+    j += ",\"import\":" + jnum(r.import_) + ",\"export\":" + jnum(r.export_) + ",\"power\":" + jnumS(r.power);
     j += ",\"has_data\":" + String(r.haveData ? "true" : "false");
     j += ",\"bootloader\":" + String(r.inBootloader ? "true" : "false");
     j += ",\"age_s\":" + String(age);
@@ -1582,8 +1584,8 @@ static void appendSample(const String &id, uint32_t ep, uint32_t imp, uint32_t e
   char line[80];
   if (obi_na(pw)) snprintf(line, sizeof line, "%lu,%lu,%lu,\n",
                            (unsigned long)ep, (unsigned long)imp, (unsigned long)exp);
-  else            snprintf(line, sizeof line, "%lu,%lu,%lu,%lu\n",
-                           (unsigned long)ep, (unsigned long)imp, (unsigned long)exp, (unsigned long)pw);
+  else            snprintf(line, sizeof line, "%lu,%lu,%lu,%ld\n",   // power is signed (negative on feed-in)
+                           (unsigned long)ep, (unsigned long)imp, (unsigned long)exp, (long)(int32_t)pw);
   f.print(line);
   size_t sz = f.size();
   f.close();
@@ -2430,7 +2432,7 @@ static void mqttService() {
                    ",\"type\":\"" + typeName(r.devType) + "\",\"battery_mV\":" + r.battery_mV +
                    ",\"rssi\":" + (int)r.lastRssi + ",\"snr\":" + String(r.lastSnr, 1) + ",\"infrared\":" + ((r.flags & 1) ? "true" : "false") +
                    ",\"import\":" + jnum(r.import_) + ",\"export\":" + jnum(r.export_) +
-                   ",\"power\":" + jnum(r.power) +
+                   ",\"power\":" + jnumS(r.power) +
                    ",\"softver\":" + String(r.softver) + ",\"hardver\":" + String(r.hardver) +
                    ",\"paired\":" + (r.haveKey ? "true" : "false") +
                    ",\"legacy\":" + (r.legacy ? "true" : "false") +
