@@ -1834,6 +1834,7 @@ const T={
   cDayExp:'Einspeisung pro Tag',capDayExp:'kWh/Tag per Solar ins Netz eingespeist — aus den Änderungen des Export-Zählerstands.',
   cImp:'Zählerstand-Verlauf · Import (Bezug)',capImp:'Kumuliert aus dem Netz bezogener Strom (kWh) — der Hauptwert.',
   cExp:'Zählerstand-Verlauf · Export (Solar-Einspeisung)',capExp:'Kumuliert per Solar ins Netz eingespeister Strom (kWh) — eigene Skala.',
+  cPow:'Leistungsverlauf (W)',capPow:'Momentanleistung über die Zeit — negative Werte bedeuten Einspeisung ins Netz.',
   cTbl:'Tages-Tabelle',capTbl:'Verbrauch (Import), Kosten und Einspeisung (Export) je Tag.',
   thDay:'Tag',thCons:'Verbrauch kWh',thCost:'Kosten €',thExp:'Export kWh',
   cHour:'Stundenwerte',capHour:'Verbrauch und Einspeisung je Stunde — die kWh-Menge in der jeweiligen Stunde aus den Zählerstand-Änderungen.',thHour:'Stunde',
@@ -1852,6 +1853,7 @@ const T={
   cDayExp:'Feed-in per day',capDayExp:'kWh/day fed into the grid (solar) — from the export-counter changes.',
   cImp:'Meter reading history · Import (consumption)',capImp:'Cumulative energy drawn from the grid (kWh) — the main value.',
   cExp:'Meter reading history · Export (solar feed-in)',capExp:'Cumulative solar energy fed into the grid (kWh) — own scale.',
+  cPow:'Power history (W)',capPow:'Instantaneous power over time — negative values mean feeding into the grid.',
   cTbl:'Daily table',capTbl:'Consumption (import), cost and feed-in (export) per day.',
   thDay:'Day',thCons:'Consumption kWh',thCost:'Cost €',thExp:'Export kWh',
   cHour:'Hourly values',capHour:'Consumption and feed-in per hour — the kWh amount within each hour from the meter-counter changes.',thHour:'Hour',
@@ -2000,6 +2002,15 @@ async function load(silent){
   let sExp={name:'Export',color:C.exp,pts:S.map(s=>[s[0],s[2]/1000])};
   html+='<div class=card><h2>'+t('cExp')+'</h2><p class=cap>'+t('capExp')+'</p>'+lineChart([sExp],'kWh')+
    '<div class=legend><span><i style="background:'+C.exp+'"></i>Export kWh</span></div></div>';
+ }
+ // instantaneous power — its own chart, NOT cumulative, and unlike import/export it legitimately goes
+ // negative on feed-in. lineChart() already lets the y-axis dip below zero (it only clamps to 0 when
+ // every value in the series is already >=0), so a feed-in dip just renders correctly with no extra work.
+ let powPts=S.filter(s=>s[3]!=null).map(s=>[s[0],s[3]]);
+ if(powPts.length>=2){
+  let sPow={name:'Power',color:C.pow,pts:powPts};
+  html+='<div class=card><h2>'+t('cPow')+'</h2><p class=cap>'+t('capPow')+'</p>'+lineChart([sPow],'W')+
+   '<div class=legend><span><i style="background:'+C.pow+'"></i>'+t('kPow')+'</span></div></div>';
  }
  // daily table
  if(cons.length){
