@@ -52,9 +52,14 @@ void gw_pair_all(uint16_t seconds);                                   // open a 
 uint32_t gw_pair_remaining_s();                                       // seconds left in the auto-pair window (0 = off)
 
 // live radio log (ring buffer) for the /radio web page
-void   gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, int snr, const char *note,
-                    const uint8_t *raw, int rawLen);                  // dir 'R'/'T'; raw = full packet bytes
-String gw_radio_json(uint32_t since);                                 // {seq, e:[...]} — entries newer than `since`
+int    gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, int snr, const char *note,
+                    const uint8_t *raw, int rawLen);                  // dir 'R'/'T'; raw = full packet bytes; returns log index
+void   gw_radio_log_dec(int idx, const uint8_t *dec, int len, const String &info);  // attach a decrypted energy payload + field breakdown to a logged RX entry
+// Streams {seq, e:[...]} (entries newer than `since`) in bounded-size chunks via sink(), rather than
+// building the whole response as one String -- a since=0 request against a full 96-entry ring buffer (with
+// the raw/decrypted/decoded-fields bytes each entry can carry) got large enough to exhaust/fragment heap
+// and silently return an empty body when this built one giant String instead.
+void   gw_radio_json(uint32_t since, void (*sink)(const String &chunk));
 
 // ---- reader firmware OTA over LoRa (serve to the reader's bootloader) --------
 bool     gw_ota_begin(const uint8_t handle[3], uint32_t total, uint8_t version);  // alloc + target a reader

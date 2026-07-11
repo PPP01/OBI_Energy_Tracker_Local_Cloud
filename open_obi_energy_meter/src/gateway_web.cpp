@@ -1357,9 +1357,13 @@ static void handlePairAll() {
   gw_pair_all(s);
   server.send(200, "application/json", String("{\"ok\":true,\"seconds\":") + s + "}");
 }
+static void sendRadioChunk(const String &chunk) { server.sendContent(chunk); }
 static void handleRadioApi() {
   uint32_t since = strtoul(server.arg("since").c_str(), nullptr, 10);
-  server.send(200, "application/json", gw_radio_json(since));
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  gw_radio_json(since, sendRadioChunk);
+  server.sendContent("");                                // terminate the chunked response
 }
 static void handleRadioPage() {
   server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset=utf-8><link rel=icon href=/favicon.svg>
@@ -1375,7 +1379,12 @@ th{color:var(--dim);text-align:left;font-weight:600;padding:4px 8px;border-botto
 td{padding:2px 8px;border-bottom:1px solid #172030;white-space:nowrap}
 tr.T td{color:var(--tx)}tr.R td{color:var(--txt)}.hl{color:var(--rx)}.dim{color:var(--dim)}
 .d{font-weight:700}.filt{width:110px;background:#1b2430;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:6px 8px;font-family:var(--mono);font-size:12px}
-td.bytes{white-space:normal;word-break:break-all;color:var(--dim);font-size:11px;line-height:1.45;max-width:560px;letter-spacing:.5px}
+td.bytes{white-space:normal}
+td.bytes>div{word-break:break-all;font-size:11px;line-height:1.5;letter-spacing:.5px;margin:2px 0}
+td.bytes .raw{color:var(--dim)}
+td.bytes .dec{color:var(--rx);word-break:break-all}
+td.bytes .di{color:var(--txt);word-break:break-word;letter-spacing:normal}
+td.bytes .di b{color:var(--rx)}
 @media (max-width:760px){
  header{flex-wrap:wrap;position:static;gap:8px;padding:11px 13px}  /* scroll away, don't overflow */
  .sp{display:none}
@@ -1390,7 +1399,7 @@ td.bytes{white-space:normal;word-break:break-all;color:var(--dim);font-size:11px
 <header><b>📡 Radio live</b><span class=dim id=stat></span><span class=sp></span>
 <input class=filt id=filt placeholder="filter id/cmd"><button id=pause onclick=togglePause()>⏸ Pause</button>
 <button onclick="rows=[];render()">Clear</button><a href="/">← dashboard</a></header>
-<div class=wrap><table><thead><tr><th>t (ms)</th><th>dir</th><th>id</th><th>cmd</th><th>len</th><th>rssi</th><th>snr</th><th>note</th><th>bytes</th></tr></thead>
+<div class=wrap><table><thead><tr><th>t (ms)</th><th>dir</th><th>id</th><th>cmd</th><th>len</th><th>rssi</th><th>snr</th><th>note</th><th>bytes / decrypted / decoded</th></tr></thead>
 <tbody id=tb></tbody></table></div>
 <script>
 const CN={15:'beacon',17:'announce',18:'reconnect',19:'energy',22:'energy',23:'energy',24:'energy',25:'energy',
@@ -1399,9 +1408,11 @@ const CN={15:'beacon',17:'announce',18:'reconnect',19:'energy',22:'energy',23:'e
 let rows=[],since=0,paused=false;const $=i=>document.getElementById(i);
 function cname(e){return e.d==='T'?(e.n||'tx'):(CN[e.c]||('cmd'+e.c));}
 const fmtB=b=>b?b.replace(/(..)/g,'$1 ').trim():'';   // "AABBCC" -> "AA BB CC"
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const fmtDi=s=>s?esc(s).replace(/\[[^\]]+\]/g,m=>`<b>${m}</b>`):'';   // highlight "[6:10]" byte-range markers
 function render(){let f=$('filt').value.trim().toLowerCase();
  let html=rows.slice(-400).filter(e=>!f||(e.h.toLowerCase().includes(f)||cname(e).toLowerCase().includes(f)||(''+e.c)===f||(e.b||'').toLowerCase().includes(f))).reverse()
-  .map(e=>`<tr class=${e.d}><td class=dim>${e.t}</td><td class=d>${e.d==='T'?'» TX':'« RX'}</td><td class=hl>${e.h}</td><td class=d>${cname(e)}${e.d==='R'?' <span class=dim>('+e.c+')</span>':''}</td><td>${e.l}</td><td>${e.d==='R'?e.r:''}</td><td>${e.d==='R'?e.sn:''}</td><td class=dim>${e.n||''}</td><td class=bytes>${fmtB(e.b)}</td></tr>`).join('');
+  .map(e=>`<tr class=${e.d}><td class=dim>${e.t}</td><td class=d>${e.d==='T'?'» TX':'« RX'}</td><td class=hl>${e.h}</td><td class=d>${cname(e)}${e.d==='R'?' <span class=dim>('+e.c+')</span>':''}</td><td>${e.l}</td><td>${e.d==='R'?e.r:''}</td><td>${e.d==='R'?e.sn:''}</td><td class=dim>${e.n||''}</td><td class=bytes><div class=raw>${fmtB(e.b)}</div>${e.dc?`<div class=dec>${fmtB(e.dc)}</div>`:''}${e.di?`<div class=di>${fmtDi(e.di)}</div>`:''}</td></tr>`).join('');
  $('tb').innerHTML=html;}
 async function poll(){if(paused)return;
  try{let r=await(await fetch('/api/radio?since='+since)).json();

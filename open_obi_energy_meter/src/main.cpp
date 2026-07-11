@@ -185,15 +185,20 @@ static void hexdump(const uint8_t *p, size_t n) {
 
 // ---- live radio log ring buffer (served by the /radio web page) ------------
 static const int RAW_MAX = 255;   // store the whole packet (LoRa RX buffer is 256 B) so nothing is truncated
+static const int DEC_MAX = 32;    // decrypted energy payload is at most ~24 B (1.2.x layout); some headroom
+static const int DECINFO_MAX = 150;  // fits describeEnergy()'s longest formatted string
 struct Rlog { uint32_t seq, ms; char dir; uint8_t h[3]; int16_t cmd, len, rssi, snr; char note[20];
-              uint8_t rawLen; uint8_t raw[RAW_MAX]; };
-static const int RLOG_N = 96;     // ~96 * ~280 B ≈ 27 KB RAM; client keeps its own 800-row history anyway
+              uint8_t rawLen; uint8_t raw[RAW_MAX];
+              uint8_t decLen; uint8_t dec[DEC_MAX];      // dec: TEA-decrypted energy payload, if any (see gw_radio_log_dec)
+              char decInfo[DECINFO_MAX]; };               // decInfo: byte-range-annotated field breakdown of dec, e.g. "[6:10]imp=..."
+static const int RLOG_N = 96;     // ~96 * ~310 B ≈ 29 KB RAM; client keeps its own 800-row history anyway
 static Rlog g_rl[RLOG_N];
 static volatile uint32_t g_rlSeq = 0;
 static int g_rlHead = 0;
-void gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, int snr, const char *note,
-                  const uint8_t *raw, int rawLen) {
-  Rlog &e = g_rl[g_rlHead];
+int gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, int snr, const char *note,
+                 const uint8_t *raw, int rawLen) {
+  int idx = g_rlHead;
+  Rlog &e = g_rl[idx];
   e.seq = ++g_rlSeq; e.ms = millis(); e.dir = dir;
   if (h) memcpy(e.h, h, 3); else { e.h[0] = e.h[1] = e.h[2] = 0; }
   e.cmd = (int16_t)cmd; e.len = (int16_t)len; e.rssi = (int16_t)rssi; e.snr = (int16_t)snr;
@@ -201,25 +206,58 @@ void gw_radio_log(char dir, const uint8_t h[3], int cmd, int len, int rssi, int 
   int n = rawLen < 0 ? 0 : (rawLen > RAW_MAX ? RAW_MAX : rawLen);
   e.rawLen = (uint8_t)n;
   if (raw && n) memcpy(e.raw, raw, n);
+  e.decLen = 0;
+  e.decInfo[0] = 0;
   g_rlHead = (g_rlHead + 1) % RLOG_N;
+  return idx;
 }
-String gw_radio_json(uint32_t since) {
-  String j = "{\"seq\":" + String(g_rlSeq) + ",\"e\":[";
+// Attach the TEA-decrypted energy payload to an already-logged RX entry (called right after decryption
+// succeeds, from the SAME handleRx invocation that logged it via gw_radio_log — idx is still valid, nothing
+// else writes to g_rl between the two calls). Lets the /radio page show cleartext energy values alongside
+// the still-encrypted raw frame bytes, without needing a separate one-off debug field (see git history:
+// an earlier "dbgRaw" field on Reader served a similar purpose for the LATEST reading only; this instead
+// shows it per-packet, live, for every reader, and doesn't linger in the Reader struct). `info`, if given,
+// is a byte-range-annotated field breakdown (see describeEnergy()/describeEnergyOld()) shown next to the
+// raw hex so it's clear which bytes produced which decoded value.
+void gw_radio_log_dec(int idx, const uint8_t *dec, int len, const String &info) {
+  if (idx < 0 || idx >= RLOG_N || !dec || len <= 0) return;
+  Rlog &e = g_rl[idx];
+  int n = len > DEC_MAX ? DEC_MAX : len;
+  e.decLen = (uint8_t)n;
+  memcpy(e.dec, dec, n);
+  strncpy(e.decInfo, info.c_str(), DECINFO_MAX - 1);
+  e.decInfo[DECINFO_MAX - 1] = 0;
+}
+void gw_radio_json(uint32_t since, void (*sink)(const String &chunk)) {
+  String chunk; chunk.reserve(1500);
+  chunk = "{\"seq\":" + String(g_rlSeq) + ",\"e\":[";
   bool first = true;
   for (int i = 0; i < RLOG_N; i++) {
     Rlog &e = g_rl[i];
     if (e.seq == 0 || e.seq <= since) continue;
     char hs[7]; snprintf(hs, sizeof hs, "%02X%02X%02X", e.h[0], e.h[1], e.h[2]);
-    if (!first) j += ",";
+    if (!first) chunk += ",";
     first = false;
-    j += "{\"s\":" + String(e.seq) + ",\"t\":" + String(e.ms) + ",\"d\":\"" + String(e.dir) +
+    chunk += "{\"s\":" + String(e.seq) + ",\"t\":" + String(e.ms) + ",\"d\":\"" + String(e.dir) +
          "\",\"h\":\"" + String(hs) + "\",\"c\":" + String(e.cmd) + ",\"l\":" + String(e.len) +
          ",\"r\":" + String(e.rssi) + ",\"sn\":" + String(e.snr) + ",\"n\":\"" + String(e.note) + "\",\"b\":\"";
     char bb[3];
-    for (int k = 0; k < e.rawLen; k++) { snprintf(bb, sizeof bb, "%02X", e.raw[k]); j += bb; }
-    j += "\"}";
+    for (int k = 0; k < e.rawLen; k++) { snprintf(bb, sizeof bb, "%02X", e.raw[k]); chunk += bb; }
+    chunk += "\"";
+    if (e.decLen) {
+      chunk += ",\"dc\":\"";
+      for (int k = 0; k < e.decLen; k++) { snprintf(bb, sizeof bb, "%02X", e.dec[k]); chunk += bb; }
+      chunk += "\"";
+      // decInfo is built entirely by us (describeEnergy()/describeEnergyOld(), only digits/letters/
+      // "[]:()=,%" and the literal words "ok"/"BAD") -- never contains a quote or backslash, so it's
+      // safe to embed directly without a JSON-escaping helper.
+      if (e.decInfo[0]) chunk += ",\"di\":\"" + String(e.decInfo) + "\"";
+    }
+    chunk += "}";
+    if (chunk.length() > 1400) { sink(chunk); chunk = ""; }
   }
-  return j + "]}";
+  chunk += "]}";
+  sink(chunk);
 }
 
 // transmit a frame, then go back to RX
@@ -634,6 +672,43 @@ static bool printEnergy(const uint8_t *pl, size_t n) {
   return crcOk;
 }
 
+// Byte-range-annotated breakdown of a decrypted energy payload, for the /radio live view (see
+// gw_radio_log_dec) -- "[byte range]label=value" per field, so it's visible at a glance which bytes of
+// the cleartext produce which decoded value. Mirrors the exact field layout printEnergy()/printEnergyOld()
+// above already use; kept as separate functions (rather than having those return a String) so the
+// Serial-log path stays untouched.
+static String describeEnergy(const uint8_t *pl, size_t n) {
+  if (n < 22) return "(payload too short)";
+  uint16_t crcStored = (pl[0] << 8) | pl[1];
+  uint16_t crcCalc   = obi_crc16(pl + 2, 20);
+  bool crcOk = crcStored == crcCalc || crcStored == (uint16_t)((crcCalc << 8) | (crcCalc >> 8));
+  uint8_t  flags   = pl[5];
+  uint32_t import  = rd_be32(pl + 6);
+  uint32_t export_ = rd_be32(pl + 10);
+  uint32_t power   = rd_be32(pl + 14);
+  char buf[150];
+  if (power == 0x7FFFFFFF)
+    snprintf(buf, sizeof buf,
+      "[0:2]crc=%s [2]sv=%u [3]hv=%u [4]batt=%umV [5]flags=0x%02X(ir=%u,lp=%u) [6:10]imp=%lu [10:14]exp=%lu [14:18]pow=n/a",
+      crcOk ? "ok" : "BAD", pl[2], pl[3], 20 * pl[4], flags, flags & 1, (flags >> 1) & 1,
+      (unsigned long)import, (unsigned long)export_);
+  else
+    snprintf(buf, sizeof buf,
+      "[0:2]crc=%s [2]sv=%u [3]hv=%u [4]batt=%umV [5]flags=0x%02X(ir=%u,lp=%u) [6:10]imp=%lu [10:14]exp=%lu [14:18]pow=%ld",
+      crcOk ? "ok" : "BAD", pl[2], pl[3], 20 * pl[4], flags, flags & 1, (flags >> 1) & 1,
+      (unsigned long)import, (unsigned long)export_, (long)power);
+  return String(buf);
+}
+static String describeEnergyOld(const uint8_t *pl, size_t n) {
+  if (n < 16) return "(payload too short)";
+  char buf[130];
+  snprintf(buf, sizeof buf,
+    "[0]sv=%u [1]hv=%u [2]batt=%umV [3]flags=0x%02X(ir=%u,lp=%u,ts=%u) [4:8]pos=%lu [8:12]neg=%lu [12:16]pow=%lu",
+    pl[0], pl[1], 20 * pl[2], pl[3], pl[3] & 1, (pl[3] >> 1) & 1, (pl[3] >> 2) & 1,
+    (unsigned long)rd_be32(pl + 4), (unsigned long)rd_be32(pl + 8), (unsigned long)rd_be32(pl + 12));
+  return String(buf);
+}
+
 // ---- RX handling -----------------------------------------------------------
 static void handleRx() {
   uint8_t buf[256];
@@ -655,7 +730,7 @@ static void handleRx() {
   obi_xor(d, len, handle, 3);
   uint8_t cmd = d[3] & 0x3F;
 
-  gw_radio_log('R', handle, cmd, len, (int)rssi, (int)snr, "", d, len);   // live radio view (/radio) — d = XOR-decoded frame
+  int rlogIdx = gw_radio_log('R', handle, cmd, len, (int)rssi, (int)snr, "", d, len);   // live radio view (/radio) — d = XOR-decoded frame; idx used below to attach the decrypted energy payload, if any
   // Always mark a known reader "seen" on ANY frame it sends (even ones we can't decode / don't ack),
   // so the UI keeps it fresh whether or not it's assigned/keyed.
   { Reader *seen = findReader(handle);
@@ -785,6 +860,9 @@ static void handleRx() {
         if (how) {
           Serial.printf("  energy [%s]: ", how); hexdump(p, plen); Serial.println();
           if (legacy) printEnergyOld(p, plen); else printEnergy(p, plen);
+          // show the cleartext payload + a byte-range-annotated field breakdown on /radio, next to the
+          // still-TEA raw frame
+          gw_radio_log_dec(rlogIdx, p, (int)plen, legacy ? describeEnergyOld(p, plen) : describeEnergy(p, plen));
           r->decoded = true; r->decFails = 0; r->inBootloader = false;   // back to normal app operation
           // OTA auto-finish: if THIS reader pulled our armed image (was in its bootloader for the OTA) and is
           // now decoding energy again, it has flashed + rebooted into the new firmware -> the update is done.
