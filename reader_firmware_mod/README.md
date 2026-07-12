@@ -22,17 +22,8 @@ result into the firmware.
   Live-verified on real hardware across sustained periods in both
   directions and across real import↔export transitions (see "Live
   verification" below).
-- `reader_modded_89mock_v90_ISKRA_MT691.bin` — the ISKRA MT-691 "nothing
-  decodes at all" fix (see "ISKRA MT-691 fix" below), built by
-  `python splice_ISKRA_MT691.py` (reuses the plain build's `hooks.bin` —
-  no separate `build.sh` variant needed). Flash this instead of the plain
-  variant for an ISKRA MT-691 whose readings never show up at all. **NOT
-  live-verified** — built entirely from static analysis of a third-party
-  SML capture; no ISKRA MT-691 hardware or sniffer was available to this
-  project to confirm it in practice (see that section for details and
-  confidence level).
 
-  **Naming/versioning is deliberate, and identical across all three
+  **Naming/versioning is deliberate, and identical across both
   release files**: each firmware's OWN reported softver is 89, but the
   RELEASE is named/tagged "v90" — a permanent "mock version" mismatch, not
   a leftover dev artifact. The gateway's web UI parses the OTA target
@@ -44,23 +35,21 @@ result into the firmware.
   reader back onto a known-good build, or to switch a reader from one
   variant to another — without ever hitting the "already this version,
   skipping" OTA no-op a same-numbered file would. If you build a further
-  local iteration of any variant with `splice.py`/`splice_DWSB20_2TH.py`/
-  `splice_ISKRA_MT691.py`, keep both numbers matched to what's actually
-  being tested (see the comment above each script's softver patch) — the
-  89/"v90" mismatch is only for the pinned release builds.
+  local iteration of any variant with `splice.py`/`splice_DWSB20_2TH.py`,
+  keep both numbers matched to what's actually being tested (see the
+  comment above each script's softver patch) — the 89/"v90" mismatch is
+  only for the pinned release builds.
 - `hooks.c`, `entry.S`, `link.ld`, `vendor.h`, `build.sh`, `splice.py`,
-  `splice_DWSB20_2TH.py`, `splice_ISKRA_MT691.py` — shared source and
+  `splice_DWSB20_2TH.py` — shared source and
   build scripts. `hooks.c` has the DWSB20.2TH fix guarded behind
   `#ifdef FIX_NEGATIVE_POWER`, which `./build.sh DWSB20_2TH` defines;
   `./build.sh` (no argument) builds the plain int24 + SML-Int16-sign-fix
-  variant that `splice.py` AND `splice_ISKRA_MT691.py` both start from
-  (the ISKRA fix is a pure additional byte patch on top, no extra C hook
-  needed). All variants read the SAME `hooks.c`/`entry.S`, so a change to
-  shared logic (int24 decode, the Int16 sign fix) only needs to be made
-  once and propagates to every variant on the next build. These are the
-  durable, repeatable release process going forward — run
-  `./build.sh && python splice.py`, `./build.sh DWSB20_2TH && python
-  splice_DWSB20_2TH.py`, and `python splice_ISKRA_MT691.py` whenever
+  variant that `splice.py` starts from. All variants read the SAME
+  `hooks.c`/`entry.S`, so a change to shared logic (int24 decode, the
+  Int16 sign fix) only needs to be made once and propagates to every
+  variant on the next build. These are the durable, repeatable release
+  process going forward — run `./build.sh && python splice.py`, and
+  `./build.sh DWSB20_2TH && python splice_DWSB20_2TH.py` whenever
   `hooks.c`/`entry.S` changes.
 - `fix_negative_power.py` — standalone patch script for an early,
   abandoned approach (SML Int8/Int16 dispatch-table retargeting). Kept
@@ -151,9 +140,7 @@ negative value — most relevantly, a meter's power (16.7.0) reading during
 feed-in, if that meter (unlike DWSB20.2TH, which uses a wider, 24-bit
 field with its own separate encoding bug — see below) encodes power as a
 correctly-signed Integer16 that this reader then fails to decode as
-signed. Confirmed against a real capture from a third-party report (an
-ISKRA MT-691 meter, see "ISKRA MT-691 fix" below) where this was the exact
-failure mode for a -417 W reading.
+signed.
 
 **Fix**: `entry_sxth16_fix` (`entry.S`) replaces the 4-byte
 `asrs r1,r0,#0x1f ; str r1,[r4,#4]` at `0xC110` (inside `sub_C0A4`'s 0x53
@@ -354,90 +341,6 @@ single, actually-live code path (confirmed via a live sentinel, not just
 static analysis) using ground-truth signals that are themselves
 unaffected by the bug, over trying to intercept or override a value
 further downstream in a pipeline that isn't fully mapped.
-
-## ISKRA MT-691 fix
-
-**⚠️ NOT live-verified.** Built entirely from static analysis (IDA
-decompile/disasm) of a real SML capture supplied secondhand by a user
-relaying a report from someone else — no ISKRA MT-691 hardware, meter
-sniffer, or paired reader was available to this project to confirm the
-fix in practice. Treat as best-effort until someone confirms it working
-(or not) against a real MT-691.
-
-**The bug**: with an ISKRA MT-691 meter, NOTHING is decoded/displayed —
-not a sign/magnitude issue like DWSB20.2TH, total silence. The supplied
-capture was manually decoded and confirmed fully standards-compliant SML
-with no defect of the meter's own encoding: a clean `SML_GetList.Res`
-with entries for a manufacturer-ID octet string ("ISK"), a serial number,
-then OBIS `1-0:1.8.0` (import, Unsigned32 + scaler -1), `1-0:2.8.0`
-(export, same), and `1-0:16.7.0` (power, Integer16, correctly
-two's-complement-signed value -417). Every value type involved
-(Unsigned32/Integer16/OctetString) is already supported by the stock SML
-value-type dispatch, and the generic OBIS matcher (`sub_B0C8`) walks
-variable-length fields correctly regardless of this meter's unusual
-leading manufacturer-ID/serial entries — so nothing about the meter's
-telegram itself is at fault, unlike the DWSB20.2TH case.
-
-**Root cause**, fully traced via IDA (addresses verified against the
-actual binary, not assumed from names): `sub_9DA0` — the import/export
-multi-tariff (OBIS 1.8.0–1.8.4 / 2.8.0–2.8.4) cache/dedup helper called
-from `sub_77B4` — sets a 1-byte "suppress" flag at `unk_20000D68+0x10`
-(import) / `+0x11` (export) whenever a tariff register present in the
-PREVIOUS telegram is missing from the current one, within a 30-minute
-window. This is an intentional "don't trust a register that just
-vanished" dedup signal, and `sub_9DA0` already correctly implements it AT
-THE VALUE LEVEL: it forces the corresponding value to the `0x7FFFFFFF`
-sentinel when this fires, and the downstream reporting function
-`sub_9D34` already no-ops cleanly on that sentinel. Per-field suppression
-is therefore already fully and correctly handled.
-
-The actual bug is one level up, in the outer dispatcher `sub_AA7C`
-(`0xAAEE`–`0xAAFD`): it ALSO reads those same two flags and, if EITHER is
-set, discards the ENTIRE decoded record by zeroing the struct pointer —
-including the power value (decoded independently by unrelated function
-`sub_9ED8`), whichever of import/export ISN'T flagged, and the
-"processed OK" status write. This is redundant over-reach on top of logic
-that already worked correctly one level down, and disproportionately
-damaging for a meter like the MT-691 that reports only ONE tariff
-register (`1-0:1.8.0`, no `1.8.1`–`1.8.4`): a single transient IR/parse
-miss of that one register sets the flag and blanks EVERYTHING — power
-included — for up to 30 minutes, even though the SAME telegram's power
-field decoded fine.
-
-**Fix**: delete the veto block. Pure removal, no replacement logic
-needed, since suppression already happens correctly downstream in
-`sub_9D34`. Confirmed via `xrefs_to` that nothing branches into the
-middle of this 16-byte block, so it's safe to remove as a unit — but a
-**second verification pass caught that plain NOPs would have been wrong**:
-`0xAAFE` (right after the block) isn't padding, it's the live start of a
-DIFFERENT switch case (reached via a separate `BEQ` earlier in the
-function, calling `sub_7434` for a different code path). Falling through
-into that via plain NOPs would have unconditionally run the wrong case
-and clobbered the result register on every single telegram — a new,
-worse bug than the one being fixed. The correct patch (applied) is an
-explicit `B` to the true merge point `0xAB14`, followed by NOP filler,
-overwriting the same 16 bytes (`0xAAEE`–`0xAAFD`). Does not touch
-`sub_9DA0`/`sub_B348`/`sub_C310` at all, so the 30-minute dedup/cache
-mechanism for genuine multi-tariff meters is fully preserved.
-
-Since this variant's power reading (`-417 W`, Integer16) would ALSO have
-hit the separate Integer16 sign-extension bug (see above) even after this
-discard-block fix, `splice_ISKRA_MT691.py` includes BOTH fixes —
-`entry_sxth16_fix` and the `sub_AA7C` patch — reusing the plain variant's
-`hooks.bin` (no `FIX_NEGATIVE_POWER`-guarded hooks are needed here, unlike
-the DWSB20.2TH variant).
-
-**Confidence**: high for the branch-offset arithmetic specifically (an
-independent second IDA pass caught the plain-NOP bug above, and the final
-`B`-instruction offset was independently recomputed by hand outside of
-IDA and matched exactly, plus cross-checked against an already-present
-`B` instruction elsewhere in the same binary to validate the encoding
-convention). Medium-high for the discard-flag root-cause analysis (traced
-through real disassembly/decompile at every step, not inferred from
-names) — the residual uncertainty is purely "does this actually fix the
-real hardware's behavior," which by definition cannot be confirmed without
-a real MT-691. If you have one and flash this build, feedback (via a
-GitHub issue) on whether it helped would be genuinely valuable.
 
 ## Why a glue stub instead of a direct BL into the C function?
 
