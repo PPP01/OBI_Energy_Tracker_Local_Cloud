@@ -38,14 +38,6 @@ int hook_decode_int24(u8 *p, u8 *out)
     u8 *q = p - 0x20;
     out[8] = q[0x1D];
     out[9] = q[0x1F];
-
-#ifdef FIX_NEGATIVE_POWER
-    // Mark "a 24-bit (TL=0x54) value was just decoded" so hook_power_correct2
-    // (fired moments later, downstream in the same telegram) can tell WHICH
-    // width the meter actually used for the value it's about to correct --
-    // see the WAS_INT24_ADDR block there for why this matters.
-    *((volatile u32 *)0x20001014) = 1;
-#endif
     return 1;
 }
 
@@ -199,35 +191,30 @@ i32 hook_power_correct(i32 raw)
 #define STATE_AGE_ADDR ((volatile u32 *)0x20001010)   // quiet telegrams (no tick either way) since dir was last set
 #define STICKY_MAX_AGE 5
 
-// Width-aware small-magnitude rule (2026-07-11), replacing the earlier abandoned attempt: this meter's own
-// encoder never sends a genuine positive reading via the 24-bit field (TL=0x54) at all, up to at least the
-// full small-bracket ceiling (NEG_FIX_W, 655 W) -- positive values in that whole range go out via some
-// 16-bit-family encoding (Uint16, TL=0x63) that hook_decode_int24 never sees. So if a value reaching this
-// hook (a) was actually decoded via the 24-bit path (hook_decode_int24, tracked via WAS_INT24_ADDR below --
-// set there, consumed here) AND (b) is still under NEG_FIX_W, the ONLY way that combination happens is the
-// corrupted-negative case (top byte wrongly 0x00 instead of 0xFF) -- a genuine positive reading that small
-// would never have used the 24-bit field in the first place. No dir/latch gating needed for this bracket at
-// all -- unlike the tick-based fallback below, this doesn't need to wait for a Wh counter tick, which
-// matters a lot at low power: a genuine -30 W export takes over 2 hours to tick even 1 Wh, so the tick-based
-// approach alone could never catch it in practice. Live-verified 2026-07-11: confirmed both that small
-// negative readings (e.g. -30 W, previously showing as +630 W with the tick-only approach) are now
-// corrected immediately, AND that genuine positive readings across the full 0-655 W range (including the
-// 330-655 W band this specific household regularly sees) are NOT misfired negative.
-//
-// This is deliberately NOT the same as the earlier "TRIED AND REVERTED" rule below (which checked raw
-// magnitude alone, with no way to know which width had actually been used, and wrongly flipped genuine
-// small positive readings that happened to reach this same post-decode hook via the 16-bit path). Gating
-// on WAS_INT24_ADDR removes that ambiguity -- it only fires for values this reader ITSELF confirmed came
-// through the 24-bit decoder, not merely "a small value showed up here".
-#define WAS_INT24_ADDR ((volatile u32 *)0x20001014)   // set by hook_decode_int24, consumed (read+cleared) here
-#define WIDTH_GATE_W    NEG_FIX_W   // this meter never sends genuine positive via 24-bit below this ceiling (confirmed live)
+// TRIED AND REVERTED AGAIN (2026-07-11): a "was this specific value decoded via the 24-bit path"
+// flag (WAS_INT24_ADDR, set in hook_decode_int24, consumed here), on the theory that this meter never
+// sends a genuine positive reading via TL=0x54 below NEG_FIX_W (655 W), so was24 alone (no dir/tick gating)
+// should unambiguously mean "corrupted negative". Looked correct in an initial live test window (small
+// negative readings caught instantly, small positive readings not misfired) -- but a longer live test
+// showed the correction firing on EVERY telegram under ~655 W regardless of whether that telegram's power
+// value was actually 24-bit-decoded at all, i.e. worse than the original abandoned magnitude-only rule
+// (that one at least required raw to be in the plausible bracket; this one degenerated to "always small ->
+// always negative"). Root cause not confirmed, but the leading theory: hook_decode_int24 fires for ANY
+// TL=0x54 field in the telegram, not just power -- if this meter's import/export (or some other
+// always-present field) ALSO happens to use TL=0x54, WAS_INT24_ADDR would be left at 1 by THAT decode,
+// stale by the time hook_power_correct2 checks it moments later, making the flag effectively always true
+// regardless of power's own actual encoding width. Fixing this would need either (a) proof of which
+// specific fields in this meter's telegram use TL=0x54 (would need a raw SML capture from this exact
+// meter, which no one has), or (b) a way to scope the flag much more tightly to "the last decode inside
+// sub_9ED8 specifically" rather than "the last decode anywhere in sub_77B4's processing of this telegram" --
+// neither was pursued further after reverting. Back to the tick-based dir==2 approach only; the "~30 W
+// export takes 2+ hours to tick and may never get promptly detected" limitation this leaves open needs a
+// different signal entirely (e.g. inspecting the raw SML bytes directly for a status/direction field, if
+// this meter's telegram carries one -- unconfirmed, would need a live capture to check).
 
 i32 hook_power_correct2(i32 raw)
 {
     if (raw == OBI_NA) return raw;
-
-    u32 was24 = *WAS_INT24_ADDR;
-    *WAS_INT24_ADDR = 0;   // consume: only reflects a 24-bit decode since the LAST correction check
 
     volatile u32 *impP = (volatile u32 *)0x20000D68;
     volatile u32 *expP = (volatile u32 *)0x20000D6C;
@@ -265,11 +252,12 @@ i32 hook_power_correct2(i32 raw)
     // meter's scaler) = 655.36, i.e. NEG_FIX_W below -- a completely
     // different unit from NEG_FIX_RAW, not a smaller version of it.
     //
-    // TRIED AND REVERTED (2026-07-10): an unconditional "magnitude alone
-    // proves it's negative" rule for small values, on the theory that a
-    // genuinely small positive reading would go out via the shorter
-    // Int16 encoding and never reach this decoder at all. Confirmed live
-    // this does NOT hold for sub_9ED8's path specifically: watched a
+    // TRIED AND REVERTED (2026-07-10, and again 2026-07-11 in a different
+    // form -- see the WAS_INT24_ADDR writeup above): an unconditional
+    // "magnitude alone proves it's negative" rule for small values, on the
+    // theory that a genuinely small positive reading would go out via the
+    // shorter Int16 encoding and never reach this decoder at all. Confirmed
+    // live this does NOT hold for sub_9ED8's path specifically: watched a
     // clearly import-dominant stretch (import ticking, export static)
     // where hook_power_correct2 still received small values (7-27), and
     // the unconditional rule flipped those genuinely-positive readings
@@ -278,17 +266,7 @@ i32 hook_power_correct2(i32 raw)
     // distinguish them here, unlike what holds one level down in the
     // raw SML bytes. Back to trend-only, which is anchored to the
     // (reliable, if laggy) counter ticks instead.
-    //
-    // NEW (2026-07-11): the width-gated rule above (was24 && raw <
-    // WIDTH_GATE_W) doesn't have that ambiguity -- it's checked FIRST,
-    // ahead of the tick-based trend logic, since it doesn't need to wait
-    // for a Wh counter tick at all (removing the "~1 minute of wrong
-    // readings during a direction change" lag for this specific,
-    // provably-corrupted case). The tick-based dir==2 check remains as a
-    // fallback for whatever this width check doesn't catch.
-    if (was24 && raw >= 0 && raw < WIDTH_GATE_W)
-        raw -= NEG_FIX_W;
-    else if (raw >= IMPLAUSIBLE_W)
+    if (raw >= IMPLAUSIBLE_W)
         raw -= NEG_FIX_W3;
     else if (dir == 2 && raw >= 0 && raw < NEG_FIX_W)
         raw -= NEG_FIX_W;
