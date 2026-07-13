@@ -2023,6 +2023,7 @@ function barChart(bars,unit,color){
  const W=760,H=300,pl=58,pr=16,pt=16,pb=42;
  if(!bars.length)return '<div class=empty>'+t('noDay')+'</div>';
  let vmax=Math.max(...bars.map(b=>b.value),0.001),vmin=Math.min(...bars.map(b=>b.value),0);
+ if(bars.some(b=>b.vlab))vmax*=1.16;   // headroom above the tallest bar for its two-line value label
  if(vmax===vmin)vmax=vmin+1;
  const Y=v=>pt+(1-(v-vmin)/(vmax-vmin))*(H-pt-pb),n=bars.length,bw=(W-pl-pr)/n;
  let g='';const ny=4;
@@ -2032,6 +2033,12 @@ function barChart(bars,unit,color){
  const yz=Y(0),step=Math.ceil(n/12);
  bars.forEach((b,i)=>{const x=pl+i*bw+bw*0.16,w=bw*0.68,yv=Y(b.value),top=Math.min(yv,yz),h=Math.max(Math.abs(yv-yz),0.6);
   g+=`<rect x=${x.toFixed(1)} y=${top.toFixed(1)} width=${w.toFixed(1)} height=${h.toFixed(1)} rx=2 fill="${color}"/>`;
+  // per-bar value printed HORIZONTALLY above the bar: kWh on top, € below it (nearest the bar). vlab is a
+  // 1–2 element array — the € line is omitted when its price is 0, so the money acts as an on/off switch.
+  // Font shrinks as the bars get narrower; vmax headroom (above) keeps the top line inside the chart.
+  if(b.vlab&&b.vlab.length){const cx=x+w/2,fs=n>20?8:(n>12?9:10.5),gap=fs+1,m=b.vlab.length;
+   b.vlab.forEach((s,k)=>{const ly=top-4-(m-1-k)*gap,euroLine=(m>1&&k===m-1);
+    g+=`<text x=${cx.toFixed(1)} y=${ly.toFixed(1)} text-anchor=middle fill="${euroLine?'#9aa7b8':'#eaf0f7'}" font-size=${fs}${euroLine?'':' font-weight=600'}>${s}</text>`;});}
   if(i%step===0)g+=`<text x=${(x+w/2).toFixed(1)} y=${H-16} text-anchor=middle fill="#7d8da0" font-size=10>${b.label}</text>`;});
  g+=`<text x=${pl-8} y=11 text-anchor=end fill="#7d8da0" font-size=10>${unit}</text>`;
  return `<svg class=chart viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${g}</svg>`;
@@ -2105,16 +2112,17 @@ async function load(silent){
   `<div class=kpi><div class=v>${nf(totImp,2)}</div><div class=l>${t('kImp')}</div></div>`+
   `<div class=kpi><div class="v neg">${nf(totExp,2)}</div><div class=l>${t('kExp')}</div></div>`+
   `<div class=kpi><div class=v>${today==null?'—':nf(today,2)}</div><div class=l>${t('kToday')}</div></div>`+
-  `<div class=kpi><div class="v euro">${today==null?'—':nf(today*eur,2)+' €'}</div><div class=l>${t('kCost')(nf(price,2))}</div></div>`+
+  (eur>0?`<div class=kpi><div class="v euro">${today==null?'—':nf(today*eur,2)+' €'}</div><div class=l>${t('kCost')(nf(price,2))}</div></div>`:'')+
   (anyExp?`<div class=kpi><div class="v neg">${todayExp==null?'—':nf(todayExp,2)}</div><div class=l>${t('kTodayExp')}</div></div>`:'')+
-  (anyExp?`<div class=kpi><div class="v euro">${todayExp==null?'—':nf(todayExp*eeur,2)+' €'}</div><div class=l>${t('kEarn')(nf(eprice,2))}</div></div>`:'')+
+  (anyExp&&eeur>0?`<div class=kpi><div class="v euro">${todayExp==null?'—':nf(todayExp*eeur,2)+' €'}</div><div class=l>${t('kEarn')(nf(eprice,2))}</div></div>`:'')+
   `<div class=kpi><div class=v>${lastPow==null?'—':nf(lastPow,0)}</div><div class=l>${t('kPow')}</div></div>`+
  '</div>';
- // daily consumption bar chart
- let barsC=cons.slice(-31).map(c=>({label:dm(c.ep),value:c.imp}));
+ // daily consumption bar chart — each bar labelled with its kWh amount; the € cost line only when a price is set
+ const fmtK=v=>nf(v,v>=10?1:2);
+ let barsC=cons.slice(-31).map(c=>({label:dm(c.ep),value:c.imp,vlab:eur>0?[fmtK(c.imp),nf(c.imp*eur,2)+' €']:[fmtK(c.imp)]}));
  html+='<div class=card><h2>'+t('cDay')+'</h2><p class=cap>'+t('capDay')+'</p>'+barChart(barsC,'kWh',C.day)+'</div>';
- // feed-in per day (own chart + scale, only when there is any solar export)
- if(cons.some(c=>c.exp>0)){let barsE=cons.slice(-31).map(c=>({label:dm(c.ep),value:c.exp}));
+ // feed-in per day (own chart + scale, only when there is any solar export) — € earnings line only when a feed-in tariff is set
+ if(cons.some(c=>c.exp>0)){let barsE=cons.slice(-31).map(c=>({label:dm(c.ep),value:c.exp,vlab:eeur>0?[fmtK(c.exp),nf(c.exp*eeur,2)+' €']:[fmtK(c.exp)]}));
   html+='<div class=card><h2>'+t('cDayExp')+'</h2><p class=cap>'+t('capDayExp')+'</p>'+barChart(barsE,'kWh',C.exp)+'</div>';}
  // cumulative kWh — two separate charts, each with its own scale (export is far smaller than import,
  // so a shared axis would flatten it to the baseline). Import = grid draw (main value), Export = solar feed-in.
@@ -2152,8 +2160,10 @@ async function load(silent){
  }
  // daily table
  if(cons.length){
-  let rows=cons.slice(-31).reverse().map(c=>`<tr><td>${dmy(c.ep)}</td><td class="mono pos">${nf(c.imp,3)}</td><td class="mono euro">${nf(c.imp*eur,2)} €</td><td class="mono neg">${anyExp?nf(c.exp,3):'—'}</td><td class="mono euro">${anyExp?nf(c.exp*eeur,2)+' €':'—'}</td></tr>`).join('');
-  html+='<div class=card><h2>'+t('cTbl')+'</h2><p class=cap>'+t('capTbl')+'</p><div class=twrap><table><thead><tr><th>'+t('thDay')+'</th><th>'+t('thCons')+'</th><th>'+t('thCost')+'</th><th>'+t('thExp')+'</th><th>'+t('thEarn')+'</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+  const showCost=eur>0,showExp=anyExp,showEarn=anyExp&&eeur>0;   // € columns only when their price is set
+  let head='<th>'+t('thDay')+'</th><th>'+t('thCons')+'</th>'+(showCost?'<th>'+t('thCost')+'</th>':'')+(showExp?'<th>'+t('thExp')+'</th>':'')+(showEarn?'<th>'+t('thEarn')+'</th>':'');
+  let rows=cons.slice(-31).reverse().map(c=>'<tr><td>'+dmy(c.ep)+'</td><td class="mono pos">'+nf(c.imp,3)+'</td>'+(showCost?'<td class="mono euro">'+nf(c.imp*eur,2)+' €</td>':'')+(showExp?'<td class="mono neg">'+nf(c.exp,3)+'</td>':'')+(showEarn?'<td class="mono euro">'+nf(c.exp*eeur,2)+' €</td>':'')+'</tr>').join('');
+  html+='<div class=card><h2>'+t('cTbl')+'</h2><p class=cap>'+t('capTbl')+'</p><div class=twrap><table><thead><tr>'+head+'</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
  }
  // hourly values: kWh consumed / fed-in within each local clock hour (from the counter deltas)
  if(S.length>1){
