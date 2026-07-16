@@ -1870,6 +1870,65 @@ static void handleHistoryApi() {
   server.sendContent("");                                // terminate the chunked response
 }
 
+static String isoLocal(time_t ep) {
+  struct tm lt; localtime_r(&ep, &lt);
+  char b[24]; strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &lt);
+  return String(b);
+}
+
+// Stream a CSV blob (epoch-prefixed lines already on flash, same layout as the /s|/d files) out as a
+// downloadable CSV: a header row, then each line with a local-time column prepended. Same epoch sanity
+// filter as streamRows() so a poisoned row (see that comment) doesn't end up in the export either.
+static void sendCsvRows(const String &csv, const char *header) {
+  server.sendContent(header); server.sendContent("\n");
+  int i = 0, n = (int)csv.length();
+  String chunk; chunk.reserve(1600);
+  while (i < n) {
+    int nl = csv.indexOf('\n', i); if (nl < 0) nl = n;
+    String line = csv.substring(i, nl); line.trim(); i = nl + 1;
+    if (!line.length()) continue;
+    int fc = line.indexOf(',');
+    unsigned long ep = strtoul((fc < 0 ? line : line.substring(0, fc)).c_str(), nullptr, 10);
+    if (ep <= 1735689600UL || ep >= 4102444800UL) continue;
+    chunk += isoLocal((time_t)ep); chunk += ","; chunk += line; chunk += "\n";
+    if (chunk.length() > 1400) { server.sendContent(chunk); chunk = ""; }
+  }
+  if (chunk.length()) server.sendContent(chunk);
+}
+
+// /api/history/csv?id=<6hex>&kind=raw|daily — same two logs the JSON /api/history serves, but as a
+// downloadable CSV file (with a human-readable local-time column) instead of chart-ready JSON.
+static void handleHistoryCsv() {
+  String id = server.arg("id");
+  bool okid = id.length() == 6;
+  if (okid) for (size_t k = 0; k < 6; k++) {
+    char c = id[k];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) { okid = false; break; }
+  }
+  if (!okid) { server.send(400, "text/plain", "bad id"); return; }
+  id.toLowerCase();
+  bool daily = server.arg("kind") == "daily";
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Content-Disposition",
+                     String("attachment; filename=\"obi_") + id + (daily ? "_daily.csv\"" : "_raw.csv\""));
+  server.send(200, "text/csv", "");
+  if (g_fsOk) {
+    if (daily) {
+      String d = fsRead(fpD(id));
+      for (int i = 0; i < MAX_READERS; i++)
+        if (hDaily[i].day && readers[i].used && hex(readers[i].handle, 3) == id) {
+          d = withDailyRow(d, hDaily[i].day, hDaily[i].imp, hDaily[i].exp);
+          break;
+        }
+      sendCsvRows(d, "date,day_start_epoch,import_wh,export_wh");
+    } else {
+      sendCsvRows(fsRead(fpS(id)), "date,epoch,import_wh,export_wh,power_w");
+    }
+  }
+  server.sendContent("");                                 // terminate the chunked response
+}
+
 static void handleHistoryClear() {
   String id = server.arg("id");
   if (id.length() == 6 && g_fsOk) {
@@ -1930,6 +1989,7 @@ header a{color:var(--accent);text-decoration:none;font-size:13px;white-space:now
 .pricebox small{color:var(--dim)}
 #price,#eprice{width:76px;font-size:16px;text-align:right}
 #psaved,#esaved{color:var(--accent);font-size:12px}
+.dllabel{color:var(--dim);font-size:12px;white-space:nowrap}
 .langtog{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .langtog button{border:0;border-radius:0;padding:8px 10px;font-size:12px;font-weight:600;background:var(--panel2);color:var(--dim)}
 .langtog button.on{background:var(--accent2);color:#fff}
@@ -1964,6 +2024,9 @@ td.mono{font-family:var(--mono)}
 <header><b>📈 OBI · History</b>
 <select id=rsel><option>…</option></select>
 <button id=rf>↻</button>
+<span id=dllabel class=dllabel></span>
+<button id=dldaily>⬇ 📅</button>
+<button id=dlraw>⬇ raw</button>
 <button id=clr>🗑</button>
 <span class=langtog><button data-l=de>DE</button><button data-l=en>EN</button></span>
 <span class=sp></span>
@@ -1979,7 +2042,7 @@ let readers=[],cur=null;
 const C={imp:'#31d07a',exp:'#5aa9ff',day:'#e3b341',pow:'#f0616d',calc:'#3ddbd9'};
 let lang=localStorage.getItem('obilang');if(lang!=='en'&&lang!=='de')lang=(navigator.language||'de').slice(0,2)==='de'?'de':'en';
 const T={
- de:{reload:'neu laden',clearT:'Historie dieses Readers löschen',priceT:'Strompreis – gilt global für alle Reader',priceTexp:'Einspeisevergütung – gilt global für alle Reader',
+ de:{reload:'neu laden',dlLabel:'Export:',dlRawT:'Rohdaten (Messpunkte) als CSV herunterladen',dlDailyT:'Tageswerte als CSV herunterladen',clearT:'Historie dieses Readers löschen',priceT:'Strompreis – gilt global für alle Reader',priceTexp:'Einspeisevergütung – gilt global für alle Reader',
   loading:'lädt…',loadErr:'Fehler beim Laden.',
   noReaders:'Noch keine Reader bekannt.<br>Sobald ein Zähler empfangen wird, erscheint hier seine Historie.',
   noHist:r=>'Für <b>'+r+'</b> wurde noch keine Historie aufgezeichnet.<br>Die Werte werden fortlaufend gespeichert — schau in ein paar Minuten wieder vorbei.',
@@ -2000,7 +2063,7 @@ const T={
   thTime:'Zeit',thPow:'Leistung W',thPowCalc:'Ø Leistung W (berechnet)',thImpK:'Import kWh',thDelta:'Δ Import kWh',thExpK:'Export kWh',thDeltaExp:'Δ Export kWh',
   fewPts:'zu wenige Messpunkte für einen Verlauf',noDay:'noch keine Tageswerte — bitte etwas Zeit sammeln',
   clearC:r=>'Gespeicherte Historie für '+r+' löschen?'},
- en:{reload:'reload',clearT:"clear this reader's history",priceT:'Electricity price – global for all readers',priceTexp:'Feed-in tariff – global for all readers',
+ en:{reload:'reload',dlLabel:'Export:',dlRawT:'Download raw samples as CSV',dlDailyT:'Download daily values as CSV',clearT:"clear this reader's history",priceT:'Electricity price – global for all readers',priceTexp:'Feed-in tariff – global for all readers',
   loading:'loading…',loadErr:'Failed to load.',
   noReaders:'No readers known yet.<br>As soon as a meter is received, its history appears here.',
   noHist:r=>'No history recorded for <b>'+r+'</b> yet.<br>Values are stored continuously — check back in a few minutes.',
@@ -2032,7 +2095,7 @@ const dm=ep=>{const d=D(ep);return lang==='de'?p2(d.getDate())+'.'+p2(d.getMonth
 const dmy=ep=>{const d=D(ep);return lang==='de'?p2(d.getDate())+'.'+p2(d.getMonth()+1)+'.'+d.getFullYear():p2(d.getDate())+'/'+p2(d.getMonth()+1)+'/'+d.getFullYear();};
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function applyLang(){document.documentElement.lang=lang;
- $('rf').title=t('reload');$('clr').title=t('clearT');$('pbox').title=t('priceT');$('ebox').title=t('priceTexp');
+ $('rf').title=t('reload');$('dllabel').textContent=t('dlLabel');$('dlraw').title=t('dlRawT');$('dldaily').title=t('dlDailyT');$('clr').title=t('clearT');$('pbox').title=t('priceT');$('ebox').title=t('priceTexp');
  document.querySelectorAll('.langtog button').forEach(b=>b.classList.toggle('on',b.dataset.l===lang));}
 document.querySelectorAll('.langtog button').forEach(b=>b.onclick=()=>{lang=b.dataset.l;localStorage.setItem('obilang',lang);applyLang();if(cur)load();});
 
@@ -2123,6 +2186,8 @@ async function saveEprice(){let v=parseFloat($('eprice').value);if(isNaN(v)||v<0
  if(cur)load();}                                    // refresh the earnings columns for the current reader
 sel.onchange=()=>{cur=sel.value;localStorage.setItem('obihist',cur);load();};
 $('rf').onclick=()=>load();
+$('dlraw').onclick=()=>{if(cur)location.href='/api/history/csv?id='+cur+'&kind=raw';};
+$('dldaily').onclick=()=>{if(cur)location.href='/api/history/csv?id='+cur+'&kind=daily';};
 $('clr').onclick=async()=>{if(!cur||!confirm(t('clearC')(cur)))return;
  await fetch('/api/history/clear?id='+cur,{method:'POST'});load();};
 // silent auto-refresh every 60 s so the history stays current — no flicker, skipped while hidden or editing the price
@@ -2310,6 +2375,7 @@ static void startServices() {
   server.on("/api/radio",       HTTP_GET,  guard(handleRadioApi));
   server.on("/history",         HTTP_GET,  guard(handleHistoryPage)); // per-reader energy history + charts
   server.on("/api/history",     HTTP_GET,  guard(handleHistoryApi));
+  server.on("/api/history/csv", HTTP_GET,  guard(handleHistoryCsv));
   server.on("/api/history/clear", HTTP_POST, guard(handleHistoryClear));
   server.on("/api/price",       HTTP_GET,  guard(handlePrice));        // read the € ct/kWh price
   server.on("/api/price",       HTTP_POST, guard(handlePrice));        // set + persist it
