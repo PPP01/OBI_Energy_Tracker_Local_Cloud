@@ -3051,6 +3051,15 @@ static void webTask(void *) {
         Serial.printf("[web] WiFi lost — setup AP '%s' back up at 192.168.4.1\n", apSsid());
       }
     }
+    if (g_apActive && !conn) {   // still down -- keep retrying the saved network. WiFiManager turns on
+      static uint32_t lastRetryMs = 0;   // WiFi.setAutoReconnect(), but that alone was observed to raise
+      uint32_t nowMs = millis();         // the AP once on disconnect and then never reconnect again on its
+      if (nowMs - lastRetryMs > 30000UL) {   // own -- even once the router/AP it was on comes back up.
+        lastRetryMs = nowMs;
+        Serial.println("[web] WiFi still down — retrying saved network");
+        WiFi.begin();   // non-blocking; reuses the SSID/PSK persisted in NVS (no-op if none saved yet)
+      }
+    }
     if (g_serverUp) {
       server.handleClient();
       if (conn) mqttService();                                // keep MQTT serviced even during a reader OTA — pausing it
